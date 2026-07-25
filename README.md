@@ -12,3 +12,7 @@ Build and repository entry points:
 ./build-AuxiNuxOS-kernel.sh
 sudo GPG_KEY=repo@auxinux.ca ./build-depot-AuxiNuxOS.sh ./output
 ```
+
+## License
+
+GPL-2.0-only, see [LICENSE](LICENSE).

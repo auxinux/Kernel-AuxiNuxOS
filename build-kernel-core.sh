@@ -62,9 +62,15 @@ DEPLOY_TARGET="${DEPLOY_TARGET:-}"
 
 KERNELORG_BASE_URL="https://cdn.kernel.org/pub/linux/kernel"
 
-# --- OpenZFS apparié au kernel (modèle Proxmox) ---
-# Construit les modules ZFS CONTRE le kernel fraîchement compilé et les empaquette
-# (kmod-zfs-<release>), pour éviter tout désappariement DKMS sur kernel récent.
+# --- OpenZFS: paquet source DKMS (modèle Debian, pas Ubuntu) ---
+# On empaquette uniquement la SOURCE OpenZFS + son dkms.conf (openzfs-zfs-dkms,
+# arch=all). La compilation du module a lieu chez l'utilisateur final via DKMS,
+# jamais sur ce serveur — on ne distribue donc jamais de binaire combinant du
+# code CDDL (OpenZFS) et du code GPL-2.0 (Linux), contrairement au modèle
+# "module précompilé" (à la Ubuntu/Proxmox) qu'utilisait cette étape avant.
+# Contrepartie: la compilation DKMS peut échouer chez l'utilisateur si les
+# headers du kernel cible ne sont pas installés — d'où l'appariement strict
+# avec linux-headers-<release> côté paquet meta (build-depot-kernel-core.sh).
 # OpenZFS 2.4.2+ supporte le kernel 7.0 (range 4.18 -> 7.0).
 WITH_ZFS="${WITH_ZFS:-auto}"          # auto = activé sur amd64 natif, sinon off
 ZFS_VERSION="${ZFS_VERSION:-2.4.2}"   # version OpenZFS qui supporte 7.0
@@ -182,10 +188,12 @@ Options:
   OUTPUT_DIR=/path           Output directory for generated .deb files.
   CHECK_DIR=/path            Directory inspected by -check-* modes.
 
-OpenZFS apparié au kernel (modèle Proxmox):
-  WITH_ZFS=auto|1|0          Build OpenZFS modules against this kernel and ship
-                             them as kmod-zfs-<release>. Default: auto
+OpenZFS (paquet source DKMS, modèle Debian):
+  WITH_ZFS=auto|1|0          Build the OpenZFS DKMS source package (openzfs-zfs-dkms,
+                             arch=all) alongside this kernel. Default: auto
                              (ON on native amd64, OFF when cross-compiling).
+                             The module itself is compiled by DKMS on the
+                             end user's machine, never on this build host.
                              Aliases: with-zfs / no-zfs.
   ZFS_VERSION=x.y.z          OpenZFS version. Default: 2.4.2 (supporte kernel 7.0).
   ZFS_SHA256=hash            sha256 du tarball zfs-<ZFS_VERSION>.tar.gz.
@@ -198,7 +206,7 @@ Examples:
   $0 --channel=lts --branch=6.18
   $0 --channel=mainline profile=desktop
   $0 profile=desktop
-  $0 profile=all                       # virtua + desktop (amd64) + ZFS apparié
+  $0 profile=all                       # virtua + desktop (amd64) + paquet DKMS ZFS
   $0 profile=all -arch=arm64           # desktop seul (virtua + ZFS sautés sur arm64)
   $0 -arch=arm64
   $0 KERNEL_VERSION=6.12.31
@@ -796,8 +804,9 @@ COMMON_DEPS=(
   gnupg dirmngr ca-certificates   # vérification GPG du source kernel.org
 )
 
-# Dépendances de build OpenZFS (modules uniquement, --with-config=kernel,
-# empaquetage NATIF Debian via native-deb-kmod / dpkg-buildpackage).
+# Dépendances de build OpenZFS: native-deb-utils construit le paquetage
+# Debian complet (dont openzfs-zfs-dkms), pas seulement le module — ces libs
+# de dev restent nécessaires même si seul le paquet DKMS est conservé ensuite.
 ZFS_DEPS=(
   autoconf automake libtool gawk
   uuid-dev libblkid-dev libudev-dev
@@ -1366,14 +1375,18 @@ make "${MAKE_ARCH_ARGS[@]}" -j"$JOBS" bindeb-pkg \
   KDEB_COMPRESS="zstd"
 
 # ============================================================
-# [7b/9] Modules OpenZFS appariés au kernel (modèle Proxmox)
+# [7b/9] Paquet source OpenZFS (DKMS) — modèle Debian, pas Ubuntu
 # ============================================================
-# On compile OpenZFS CONTRE l'arbre kernel qu'on vient de builder, puis on
-# empaquette les modules en kmod-zfs-<release>. Plus de DKMS à l'install,
-# plus de désappariement: ZFS et kernel voyagent ensemble.
+# On empaquette la SOURCE OpenZFS + son dkms.conf (openzfs-zfs-dkms, arch=all),
+# jamais un module compilé. La compilation a lieu chez l'utilisateur final via
+# DKMS, au moment de l'install/du prochain boot — jamais sur ce serveur. Ça
+# évite de distribuer un binaire combinant du code CDDL (OpenZFS) et du code
+# GPL-2.0 (Linux), au prix d'un risque d'échec de compilation côté utilisateur
+# si les headers du kernel cible ne sont pas installés (voir l'appariement
+# strict avec linux-headers-<release> dans build-depot-kernel-core.sh).
 if [[ "$WITH_ZFS" == "1" ]]; then
   echo
-  echo "[7b/9] Construction des modules OpenZFS ${ZFS_VERSION} contre le kernel..."
+  echo "[7b/9] Construction du paquet source OpenZFS ${ZFS_VERSION} (DKMS)..."
 
   ZFS_TARBALL="zfs-${ZFS_VERSION}.tar.gz"
   ZFS_URL="${ZFS_BASE_URL}/zfs-${ZFS_VERSION}/${ZFS_TARBALL}"
@@ -1406,51 +1419,47 @@ Ou passe outre (DÉCONSEILLÉ): ALLOW_UNVERIFIED_SOURCE=1"
   tar -xf "$ZFS_TARBALL"
   [[ -d "$ZFS_SRC_DIR" ]] || die "extraction ZFS échouée: $ZFS_SRC_DIR introuvable."
 
-  # Le packaging natif OpenZFS (debian/rules) RE-configure et cherche le kernel
-  # dans /lib/modules/<KVERS>/build. On installe donc nos propres headers (déjà
-  # buildés) pour exposer cet arbre, puis on cible explicitement notre version
-  # via KVERS — sinon il prend `uname -r` (le kernel de l'hôte LXC, absent).
-  ZFS_KVERS="${KERNEL_VERSION}${LOCAL_VERSION}"   # ex: 7.0.12-auxinux-virtua-amd64
-  ZFS_HDR_DEB="$(ls "$BUILD_ROOT"/linux-headers-"${ZFS_KVERS}"_*.deb 2>/dev/null | head -n1 || true)"
-  [[ -n "$ZFS_HDR_DEB" ]] \
-    || die "headers .deb introuvable pour ZFS (linux-headers-${ZFS_KVERS}_*.deb dans $BUILD_ROOT)."
-  echo "Installation des headers du kernel cible pour ZFS: $(basename "$ZFS_HDR_DEB")"
-  sudo dpkg -i "$ZFS_HDR_DEB" || sudo apt-get -f install -y
-  [[ -d "/lib/modules/${ZFS_KVERS}/build" ]] \
-    || die "/lib/modules/${ZFS_KVERS}/build absent après install des headers."
-
   cd "$ZFS_SRC_DIR"
 
-  # configure initial: génère contrib/debian/rules, ciblé sur notre kernel.
-  echo "Configuration OpenZFS contre /lib/modules/${ZFS_KVERS}/build..."
-  ./configure \
-    --with-config=kernel \
-    --with-linux="/lib/modules/${ZFS_KVERS}/build" \
-    --with-linux-obj="/lib/modules/${ZFS_KVERS}/build" \
-    --prefix=/usr
+  # Pas de --with-linux/--with-config=kernel ici: le paquet DKMS ne cible
+  # aucun kernel précis, contrairement à l'ancien build kmod apparié.
+  echo "Configuration OpenZFS (paquetage source, indépendant du kernel)..."
+  ./configure --prefix=/usr
 
-  echo "Compilation des paquets kmod ZFS (natif Debian, KVERS=${ZFS_KVERS})..."
-  # native-deb-kmod = paquets .deb NATIFS via dpkg-buildpackage (PAS alien/rpm).
-  # KVERS/KSRC exportés ET passés à make pour que debian/rules cible NOTRE kernel.
-  export KVERS="$ZFS_KVERS" KSRC="/lib/modules/${ZFS_KVERS}/build"
-  make -j"$JOBS" native-deb-kmod \
-    KVERS="$ZFS_KVERS" \
-    KSRC="/lib/modules/${ZFS_KVERS}/build"
+  echo "Construction du paquetage Debian natif OpenZFS (PAS d'alien/rpm)..."
+  # native-deb-utils = cible Makefile.am d'OpenZFS lançant dpkg-buildpackage
+  # sur contrib/debian; produit openzfs-zfs-dkms (arch=all) ET des paquets
+  # userspace (zfsutils, libzfs...). Seul openzfs-zfs-dkms nous intéresse ici:
+  # les outils userspace restent fournis par Debian (zfsutils-linux), comme
+  # avant. On ne construit PAS le module lui-même (pas native-deb-kmod).
+  make -j"$JOBS" native-deb-utils
 
-  # dpkg-buildpackage écrit les .deb dans le dossier PARENT (= BUILD_ROOT),
-  # donc ils sont déjà au bon endroit pour l'étape [8/9]. On valide juste.
   cd "$BUILD_ROOT"
   shopt -s nullglob
-  zfs_debs=( "$BUILD_ROOT"/*zfs-modules*.deb "$BUILD_ROOT"/kmod-zfs*.deb )
+  zfs_debs=( "$BUILD_ROOT"/openzfs-zfs-dkms_*.deb )
+  other_zfs_debs=(
+    "$BUILD_ROOT"/openzfs-libnvpair3_*.deb "$BUILD_ROOT"/openzfs-libpam-zfs_*.deb
+    "$BUILD_ROOT"/openzfs-libuutil3_*.deb "$BUILD_ROOT"/openzfs-libzfs-dev_*.deb
+    "$BUILD_ROOT"/openzfs-libzfs7_*.deb "$BUILD_ROOT"/openzfs-libzfsbootenv1_*.deb
+    "$BUILD_ROOT"/openzfs-libzpool7_*.deb "$BUILD_ROOT"/openzfs-python3-pyzfs_*.deb
+    "$BUILD_ROOT"/openzfs-pyzfs-doc_*.deb "$BUILD_ROOT"/openzfs-zfs-initramfs_*.deb
+    "$BUILD_ROOT"/openzfs-zfs-dracut_*.deb "$BUILD_ROOT"/openzfs-zfsutils_*.deb
+    "$BUILD_ROOT"/openzfs-zfs-zed_*.deb "$BUILD_ROOT"/openzfs-zfs-test_*.deb
+  )
   shopt -u nullglob
   (( ${#zfs_debs[@]} > 0 )) \
-    || die "aucun paquet .deb module ZFS trouvé dans $BUILD_ROOT après native-deb-kmod."
+    || die "paquet openzfs-zfs-dkms introuvable dans $BUILD_ROOT après native-deb-utils."
 
-  echo "Modules ZFS générés:"
+  echo "Paquet source ZFS généré:"
   for z in "${zfs_debs[@]}"; do echo "  $(basename "$z")"; done
+
+  # Les paquets userspace produits en même temps (zfsutils, libzfs...) restent
+  # hors scope de ce dépôt kernel: ils ne combinent aucun code GPL et Debian
+  # fournit déjà zfsutils-linux. On les jette pour ne pas les publier par erreur.
+  (( ${#other_zfs_debs[@]} > 0 )) && rm -f "${other_zfs_debs[@]}"
 else
   echo
-  echo "[7b/9] Modules OpenZFS: désactivé (WITH_ZFS=${WITH_ZFS})."
+  echo "[7b/9] Paquet source OpenZFS (DKMS): désactivé (WITH_ZFS=${WITH_ZFS})."
 fi
 
 # ============================================================
@@ -1492,12 +1501,14 @@ for pkg in "${debs[@]}"; do
     continue
   fi
 
-  # linux-image-*/linux-headers-*/les modules ZFS encodent déjà la release
-  # kernel complète (ex: linux-image-7.0.12-auxinuxos-amd64) dans leur nom de
-  # paquet: pas besoin de suffixe. Les autres paquets (ex: un futur meta) n'ont
-  # pas cette unicité intégrée et pourraient sinon se recouvrir entre profils.
+  # linux-image-*/linux-headers-* encodent déjà la release kernel complète
+  # (ex: linux-image-7.0.12-auxinuxos-amd64) dans leur nom de paquet: pas
+  # besoin de suffixe. openzfs-zfs-dkms est lui indépendant du profil/kernel
+  # (un seul paquet source par version d'OpenZFS): même raisonnement, un seul
+  # nom de fichier stable. Les autres paquets (ex: un futur meta) n'ont pas
+  # cette unicité intégrée et pourraient sinon se recouvrir entre profils.
   case "$pkg_name" in
-    linux-image-*|linux-headers-*|openzfs-zfs-modules-*|zfs-modules-*|kmod-zfs-*)
+    linux-image-*|linux-headers-*|openzfs-zfs-dkms)
       dest_name="${pkg_name}.deb"
       ;;
     *)
@@ -1534,7 +1545,7 @@ Source    : ${SOURCE}
 Profile   : ${PROFILE}
 Arch      : ${TARGET_ARCH} (${KBUILD_DEBARCH})
 Base src  : linux-source-${KERNEL_MAJOR} (${SOURCE_PKG_VERSION})
-OpenZFS   : $([[ "$WITH_ZFS" == "1" ]] && echo "${ZFS_VERSION} (modules appariés kmod-zfs)" || echo "non inclus")
+OpenZFS   : $([[ "$WITH_ZFS" == "1" ]] && echo "${ZFS_VERSION} (paquet source DKMS openzfs-zfs-dkms, compilé à l'install)" || echo "non inclus")
 Généré    : $(date -Iseconds)
 
 APT source:

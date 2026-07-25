@@ -65,7 +65,8 @@ Environment options:
       Default: 3. Use 0 to keep everything.
 
   ZFS_META_DEP=depends|recommends|none
-      How kernel meta-packages reference matching OpenZFS module packages.
+      How kernel meta-packages reference the openzfs-zfs-dkms source package
+      (compiled by DKMS on the end user's machine, not shipped precompiled).
       Default: recommends.
 
   ARCHES="amd64 arm64"
@@ -370,8 +371,13 @@ generate_meta_package() {
     echo "  AVERTISSEMENT: headers absents pour ${kernel_release}; meta image seulement."
   fi
 
-  # Modules OpenZFS appariés si présents dans le dépôt. Par défaut on les met
-  # en Recommends: le paquet kernel reste configurable même si ZFS échoue.
+  # Paquet source OpenZFS (DKMS) présent dans le dépôt, le cas échéant. Contrairement
+  # à l'ancien module précompilé (nommé par release kernel), openzfs-zfs-dkms est un
+  # paquet source unique (arch=all, un par version d'OpenZFS) qui se compile chez
+  # l'utilisateur via DKMS: sans les headers du kernel cible (Depends ci-dessus),
+  # cette compilation échoue à l'install plutôt qu'au build — d'où l'importance de
+  # header_pkg en Depends dès que ZFS est apparié. Par défaut le paquet ZFS lui-même
+  # reste en Recommends: le paquet kernel reste installable même si DKMS échoue.
   local zfs_pkg zfs_version
   zfs_pkg="$(
     for f in "$KERNEL_DIR"/*.deb; do
@@ -379,13 +385,16 @@ generate_meta_package() {
       pkg="$(dpkg-deb -f "$f" Package)"
       pkg_arch="$(dpkg-deb -f "$f" Architecture)"
       [[ "$pkg_arch" == "$deb_arch" || "$pkg_arch" == "all" ]] || continue
-      case "$pkg" in
-        # native-deb-kmod -> openzfs-zfs-modules-<release> ; alien -> kmod-zfs-<release>
-        kmod-zfs-"${kernel_release}"|zfs-modules-"${kernel_release}"|*zfs-modules-"${kernel_release}")
-          echo "$pkg"; break ;;
-      esac
+      [[ "$pkg" == "openzfs-zfs-dkms" ]] && { echo "$pkg"; break; }
     done
   )"
+  if [[ -n "$zfs_pkg" && "$ZFS_META_DEP" != "none" && -z "$header_version" ]]; then
+    die "openzfs-zfs-dkms trouvé mais ${header_pkg} absent du dépôt.
+DKMS échouera à l'install sans les headers exacts du kernel cible: publie
+${header_pkg} avant de republier ce dépôt, ou ZFS_META_DEP=none pour ignorer
+explicitement l'appariement ZFS de ce build."
+  fi
+
   if [[ -n "$zfs_pkg" ]]; then
     zfs_version="$(
       for f in "$KERNEL_DIR"/*.deb; do

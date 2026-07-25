@@ -1,0 +1,10 @@
+.DS_Store
+._*
+output/
+*.log
+*.deb
+*.changes
+*.buildinfo
+*.dsc
+*.tar.*
+.claude/settings.local.json

@@ -40,10 +40,18 @@ set -Eeuo pipefail
 #   JOBS=8 ./build-kernel-core.sh source=debian
 # ============================================================
 
+die() { echo; echo "ERREUR: $*" >&2; exit 1; }
+
 SOURCE="kernelorg"
 MODE="build"
 RELEASE_CHANNEL="${RELEASE_CHANNEL:-current}"
 RELEASE_BRANCH="${RELEASE_BRANCH:-}"
+
+# Canal de publication: "prod" (defaut) ou "dev". Le canal dev produit un
+# kernel au suffixe dev-<flavour>, un meta <meta>-dev, et est publie dans une
+# suite APT distincte (kernel-dev) par build-depot-kernel-core.sh. Les deux
+# canaux peuvent donc etre installes cote a cote et selectionnes au boot.
+RELEASE_TRACK="${RELEASE_TRACK:-prod}"
 
 PROFILE="${PROFILE:-virtua}"
 PROFILES="${PROFILES:-}"
@@ -88,6 +96,11 @@ KERNEL_ORG_KEYS=(
 KERNEL_ORG_KEYSERVER="${KERNEL_ORG_KEYSERVER:-hkps://keys.openpgp.org}"
 # Garde-fou: ne JAMAIS mettre 1 en production. Uniquement build hors-ligne/test.
 ALLOW_UNVERIFIED_SOURCE="${ALLOW_UNVERIFIED_SOURCE:-0}"
+# Le choix du canal mainline force le saut de verification du TARBALL KERNEL
+# (snapshot git sans .tar.sign), ce qui ne doit PAS desactiver la verification
+# sha256 d'OpenZFS: les deux sources n'ont aucun rapport.
+ALLOW_UNVERIFIED_KERNEL_SOURCE="${ALLOW_UNVERIFIED_KERNEL_SOURCE:-$ALLOW_UNVERIFIED_SOURCE}"
+ALLOW_UNVERIFIED_ZFS_SOURCE="${ALLOW_UNVERIFIED_ZFS_SOURCE:-$ALLOW_UNVERIFIED_SOURCE}"
 
 usage() {
   cat <<EOF
@@ -130,6 +143,16 @@ Profiles:
       On non-amd64 targets the virtua profile is skipped automatically.
       Other options (source, arch, KERNEL_VERSION, JOBS...) apply to both.
       Not compatible with -check-* modes (single profile only).
+
+Canal de publication (prod/dev):
+  track=prod                 Canal de production (défaut). Suffixe inchangé,
+                             meta kernel-<profil>, suite APT "kernel".
+  track=dev                  Canal de développement. Produit
+                             X.Y.Z-dev-<flavour>-<arch>, meta kernel-<profil>-dev,
+                             publié dans la suite APT "kernel-dev".
+                             Les deux canaux coexistent installés: on choisit
+                             le noyau à tester au boot, rollback immédiat.
+  Alias: -dev / -prod
 
 Source selection:
   source=kernelorg
@@ -341,6 +364,9 @@ for arg in "$@"; do
     --current|--stable|--latest) RELEASE_CHANNEL="current" ;;
     --lts|--longterm) RELEASE_CHANNEL="lts" ;;
     --mainline|--dev) RELEASE_CHANNEL="mainline" ;;
+    track=*|--track=*|RELEASE_TRACK=*) RELEASE_TRACK="${arg#*=}" ;;
+    -dev|--dev-track) RELEASE_TRACK="dev" ;;
+    -prod|--prod-track) RELEASE_TRACK="prod" ;;
     profile=all) PROFILES="virtua desktop" ;;
     profile=virtua) PROFILE="virtua" ;;
     profile=desktop) PROFILE="desktop" ;;
@@ -382,8 +408,14 @@ esac
 
 if [[ "$RELEASE_CHANNEL" == "mainline" || "${KERNEL_VERSION:-}" == *-rc* ]]; then
   # Choisir mainline est l'opt-in explicite requis pour le snapshot git non signé.
-  ALLOW_UNVERIFIED_SOURCE=1
+  # N'affecte QUE le kernel: la verification sha256 d'OpenZFS reste active.
+  ALLOW_UNVERIFIED_KERNEL_SOURCE=1
 fi
+
+case "$RELEASE_TRACK" in
+  prod|dev) ;;
+  *) die "RELEASE_TRACK invalide: ${RELEASE_TRACK}. Valeurs: prod, dev." ;;
+esac
 
 case "$TARGET_ARCH" in
   amd64)
@@ -508,6 +540,13 @@ if [[ -z "$KERNEL_FLAVOUR" ]]; then
     desktop) KERNEL_FLAVOUR="auxinux-desktop" ;;
     auxinuxos) KERNEL_FLAVOUR="auxinuxos" ;;
   esac
+  # Canal dev: prefixe dev- (minuscule OBLIGATOIRE: la politique Debian
+  # interdit les majuscules dans un nom de paquet, dpkg les convertit
+  # silencieusement, ce qui desynchroniserait le nom du paquet et le
+  # repertoire /lib/modules/<uname -r>) pour que la release complete soit distincte de la
+  # prod (ex: 7.2.2-dev-auxinux-virtua-amd64 vs 7.1.12-auxinux-virtua-amd64).
+  # Les noms de paquets different donc les deux kernels coexistent installes.
+  [[ "$RELEASE_TRACK" == "dev" ]] && KERNEL_FLAVOUR="dev-${KERNEL_FLAVOUR}"
 fi
 
 KERNEL_NAME_SUFFIX="${KERNEL_FLAVOUR}-${KERNEL_ARCH_SUFFIX}"
@@ -518,6 +557,7 @@ if [[ -z "$META_PACKAGE" ]]; then
     desktop) META_PACKAGE="kernel-auxinux-desktop" ;;
     auxinuxos) META_PACKAGE="kernel-auxinuxos" ;;
   esac
+  [[ "$RELEASE_TRACK" == "dev" ]] && META_PACKAGE="${META_PACKAGE}-dev"
 fi
 
 OUTPUT_DIR="${OUTPUT_DIR:-${BUILD_ROOT}/output}"
@@ -540,8 +580,6 @@ fi
 # ============================================================
 
 cfg() { ./scripts/config "$@" || true; }
-
-die() { echo; echo "ERREUR: $*" >&2; exit 1; }
 
 is_supported_debian13_base() {
   case "${ID:-}" in
@@ -895,7 +933,7 @@ else
     TARBALL_SIG=""
     DOWNLOAD_URL="https://git.kernel.org/torvalds/t/${TARBALL}"
     SIG_URL=""
-    [[ "$ALLOW_UNVERIFIED_SOURCE" == "1" ]] || die \
+    [[ "$ALLOW_UNVERIFIED_KERNEL_SOURCE" == "1" ]] || die \
       "mainline ${KERNEL_VERSION} est un snapshot git sans signature tarball. Relance avec ALLOW_UNVERIFIED_SOURCE=1 pour un build de développement explicite."
   else
     TARBALL="linux-${KERNEL_VERSION}.tar.xz"
@@ -918,8 +956,8 @@ else
   fi
 
   # Vérification de signature OBLIGATOIRE du tarball kernel.org.
-  if [[ "$ALLOW_UNVERIFIED_SOURCE" == "1" ]]; then
-    echo "AVERTISSEMENT: ALLOW_UNVERIFIED_SOURCE=1 — vérification GPG de la source IGNORÉE (déconseillé)."
+  if [[ "$ALLOW_UNVERIFIED_KERNEL_SOURCE" == "1" ]]; then
+    echo "AVERTISSEMENT: vérification GPG du source kernel IGNORÉE (déconseillé)."
   else
     echo "Vérification de la signature du source kernel.org..."
     if [[ ! -f "${TARBALL_SIG}" ]]; then
@@ -997,6 +1035,7 @@ echo "============================================================"
 echo " Virtua Kernel Builder"
 echo " Source        : ${SOURCE}"
 echo " Profile       : ${PROFILE}"
+echo " Canal         : ${RELEASE_TRACK}"
 echo " Target arch   : ${TARGET_ARCH} (kernel ARCH=${KBUILD_ARCH}, deb=${KBUILD_DEBARCH})"
 echo " Cross compile : ${CROSS_COMPILE:-none}"
 echo " Source pkg    : linux-source-${KERNEL_MAJOR} (${SOURCE_PKG_VERSION})"
@@ -1402,8 +1441,8 @@ if [[ "$WITH_ZFS" == "1" ]]; then
   fi
 
   # Vérification d'intégrité de la source ZFS (sha256 épinglé, OBLIGATOIRE).
-  if [[ "$ALLOW_UNVERIFIED_SOURCE" == "1" ]]; then
-    echo "AVERTISSEMENT: vérification du source ZFS IGNORÉE (ALLOW_UNVERIFIED_SOURCE=1)."
+  if [[ "$ALLOW_UNVERIFIED_ZFS_SOURCE" == "1" ]]; then
+    echo "AVERTISSEMENT: vérification du source ZFS IGNORÉE (ALLOW_UNVERIFIED_ZFS_SOURCE=1)."
   elif [[ -n "$ZFS_SHA256" ]]; then
     echo "Vérification sha256 du source ZFS..."
     echo "${ZFS_SHA256}  ${ZFS_TARBALL}" | sha256sum -c - \
@@ -1424,7 +1463,11 @@ Ou passe outre (DÉCONSEILLÉ): ALLOW_UNVERIFIED_SOURCE=1"
   # Pas de --with-linux/--with-config=kernel ici: le paquet DKMS ne cible
   # aucun kernel précis, contrairement à l'ancien build kmod apparié.
   echo "Configuration OpenZFS (paquetage source, indépendant du kernel)..."
-  ./configure --prefix=/usr
+  # --with-config=user: configure UNIQUEMENT la partie userspace/DKMS. Sans ce
+  # flag, OpenZFS configure aussi le build du module noyau (--with-config=all
+  # par defaut), ce qui exige des headers noyau sur ce serveur et ouvre la porte
+  # a ce qu'un objet noyau se retrouve empaquete — l'inverse de l'objectif.
+  ./configure --prefix=/usr --with-config=user
 
   echo "Construction du paquetage Debian natif OpenZFS (PAS d'alien/rpm)..."
   # native-deb-utils = cible Makefile.am d'OpenZFS lançant dpkg-buildpackage
@@ -1528,12 +1571,18 @@ case "$PROFILE" in
   auxinuxos)
     README_REPO_LABEL="AuxiNuxOS Kernel Repository"
     README_APT_URL="https://dep.auxinux.ca/AUXINUXOS/KERNEL"
+    README_KEYRING="auxinuxos-archive-keyring"
     ;;
   *)
     README_REPO_LABEL="AuxiNux Kernel Repository"
     README_APT_URL="https://dep.auxinux.ca/VIRTUA"
+    README_KEYRING="virtua-archive-keyring"
     ;;
 esac
+
+# Suite APT visee par ce build (prod -> kernel, dev -> kernel-dev).
+README_SUITE="kernel"
+[[ "$RELEASE_TRACK" == "dev" ]] && README_SUITE="kernel-dev"
 
 cat > "$OUTPUT_DIR/README-${KERNEL_NAME_SUFFIX}.txt" <<EOF
 ${README_REPO_LABEL}
@@ -1548,8 +1597,11 @@ Base src  : linux-source-${KERNEL_MAJOR} (${SOURCE_PKG_VERSION})
 OpenZFS   : $([[ "$WITH_ZFS" == "1" ]] && echo "${ZFS_VERSION} (paquet source DKMS openzfs-zfs-dkms, compilé à l'install)" || echo "non inclus")
 Généré    : $(date -Iseconds)
 
-APT source:
-deb [trusted=yes arch=${KBUILD_DEBARCH}] ${README_APT_URL} kernel main
+APT source (dépôt signé — ne jamais utiliser trusted=yes):
+  sudo wget -O /usr/share/keyrings/${README_KEYRING}.gpg \\
+       ${README_APT_URL}/${README_KEYRING}.gpg
+
+deb [signed-by=/usr/share/keyrings/${README_KEYRING}.gpg arch=${KBUILD_DEBARCH}] ${README_APT_URL} ${README_SUITE} main
 
 Installation:
   sudo apt update
@@ -1574,7 +1626,7 @@ echo
 echo "Envoi vers le serveur dépôt:"
 echo "  rsync -avz --progress ${OUTPUT_DIR}/ debian@dep.auxinux.ca:/tmp/virtua-kernel/"
 echo "Puis sur dep.auxinux.ca:"
-echo "  sudo ./build-depot-kernel.sh /tmp/virtua-kernel"
+echo "  sudo ./build-depot-kernel-core.sh /tmp/virtua-kernel"
 echo
 echo "Kernel attendu après install: ${KERNEL_VERSION}${LOCAL_VERSION}"
 echo "============================================================"

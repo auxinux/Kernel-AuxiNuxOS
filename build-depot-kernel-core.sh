@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # Virtua Kernel Repository Builder
 #
 # Usage:
-#   sudo ./build-depot-kernel.sh [IMPORT_DIR]
+#   sudo ./build-depot-kernel-core.sh [IMPORT_DIR]
 #
 # Variables optionnelles:
 #   REPO_ROOT      : racine du depot (defaut: /var/www/dep.auxinux.ca/VIRTUA)
@@ -115,8 +115,21 @@ if (( $# > 1 )); then
   exit 1
 fi
 
+die() { echo; echo "ERREUR: $*" >&2; exit 1; }
+
+# Canal de publication: prod -> suite APT "kernel" + KERNEL/
+#                       dev  -> suite APT "kernel-dev" + KERNEL-DEV/
+# Les deux canaux sont physiquement separes: un kernel DEV ne peut pas fuiter
+# dans l'index de prod, et chaque canal a sa propre retention.
+RELEASE_TRACK="${RELEASE_TRACK:-prod}"
+case "$RELEASE_TRACK" in
+  prod) _TRACK_DIST="kernel";     _TRACK_SUBDIR="KERNEL" ;;
+  dev)  _TRACK_DIST="kernel-dev"; _TRACK_SUBDIR="KERNEL-DEV" ;;
+  *) die "RELEASE_TRACK invalide: ${RELEASE_TRACK}. Valeurs: prod, dev." ;;
+esac
+
 REPO_ROOT="${REPO_ROOT:-/var/www/dep.auxinux.ca/VIRTUA}"
-KERNEL_DIR="${KERNEL_DIR:-${REPO_ROOT}/KERNEL}"
+KERNEL_DIR="${KERNEL_DIR:-${REPO_ROOT}/${_TRACK_SUBDIR}}"
 REPO_LABEL="${REPO_LABEL:-Virtua Kernel Repository}"
 REPO_DESCRIPTION="${REPO_DESCRIPTION:-Virtua Custom Kernel Repository}"
 PUBLIC_REPO_URL="${PUBLIC_REPO_URL:-https://dep.auxinux.ca/VIRTUA}"
@@ -126,14 +139,18 @@ IMPORT_DIR="${1:-$KERNEL_DIR}"
 DEPLOY="${DEPLOY:-0}"
 DEPLOY_TARGET="${DEPLOY_TARGET:-}"
 
-DIST="kernel"
+DIST="${DIST:-$_TRACK_DIST}"
 COMPONENT="main"
 ARCHES="${ARCHES:-amd64 arm64}"
 
 SIGN="${SIGN:-1}"
 GPG_KEY="${GPG_KEY:-}"
-KEEP_VERSIONS="${KEEP_VERSIONS:-3}"
-ZFS_META_DEP="${ZFS_META_DEP:-recommends}"
+KEEP_VERSIONS="${KEEP_VERSIONS:-2}"
+# "none" par defaut: le meta kernel ne tire PAS automatiquement openzfs-zfs-dkms.
+# APT installe les Recommends par defaut, ce qui reviendrait a declencher la
+# compilation CDDL+GPL chez l'utilisateur sans qu'il l'ait demandee. Debian ne
+# fait jamais ca: l'utilisateur tape explicitement `apt install openzfs-zfs-dkms`.
+ZFS_META_DEP="${ZFS_META_DEP:-none}"
 FORBIDDEN_PACKAGE_PATTERNS="${FORBIDDEN_PACKAGE_PATTERNS:-auxinuxos}"
 
 # Le script tourne en root (sudo), mais la clé GPG vit en général dans le
@@ -163,11 +180,10 @@ fi
 KEYRING_ASC="${REPO_ROOT}/${KEYRING_BASENAME}.asc"
 KEYRING_GPG="${REPO_ROOT}/${KEYRING_BASENAME}.gpg"
 
-die() { echo; echo "ERREUR: $*" >&2; exit 1; }
-
 echo "=================================================="
 echo " Virtua Repository Builder"
 echo "=================================================="
+echo "Canal         : $RELEASE_TRACK (suite APT: $DIST)"
 echo "Repo root     : $REPO_ROOT"
 echo "Kernel dir    : $KERNEL_DIR"
 echo "Import dir    : $IMPORT_DIR"
@@ -185,12 +201,18 @@ echo
 # création manuelle préalable sur un serveur dépôt neuf.
 mkdir -p "$REPO_ROOT" "$KERNEL_DIR" "$IMPORT_DIR"
 
+# Comparaison par chemin canonique: "/x/KERNEL/" et "/x/KERNEL" sont le meme
+# dossier. Sans ca, la branche d'import etait prise et `cp` refusait de copier
+# un fichier sur lui-meme -> publication entierement avortee.
+IMPORT_DIR="$(realpath "$IMPORT_DIR")"
+KERNEL_DIR="$(realpath "$KERNEL_DIR")"
+
 if [[ "$SIGN" == "1" && -z "$GPG_KEY" ]]; then
   die "SIGN=1 mais GPG_KEY non défini.
 Crée une clé dédiée puis relance avec GPG_KEY=...:
   gpg --quick-generate-key 'Virtua Kernel Repository <repo@auxinux.ca>' rsa4096 sign 0
   gpg --list-secret-keys --keyid-format=long
-  sudo GPG_KEY='repo@auxinux.ca' ./build-depot-kernel.sh
+  sudo GPG_KEY='repo@auxinux.ca' ./build-depot-kernel-core.sh
 Ou désactive la signature (déconseillé pour un dépôt public): SIGN=0"
 fi
 
@@ -200,7 +222,7 @@ if [[ "$SIGN" == "1" ]]; then
     die "clé secrète GPG introuvable pour '${GPG_KEY}' (GNUPGHOME=${GNUPGHOME:-/root/.gnupg}).
 La clé a probablement été créée par un autre utilisateur que root.
 Relance en pointant le bon trousseau, ex:
-  sudo GNUPGHOME=/home/${SUDO_USER:-debian}/.gnupg GPG_KEY='${GPG_KEY}' ./build-depot-kernel.sh
+  sudo GNUPGHOME=/home/${SUDO_USER:-debian}/.gnupg GPG_KEY='${GPG_KEY}' ./build-depot-kernel-core.sh
 Ou crée la clé directement dans ce trousseau (en root)."
   fi
 fi
@@ -224,16 +246,6 @@ echo "[1/9] Import des paquets..."
 if [[ "$IMPORT_DIR" != "$KERNEL_DIR" ]]; then
   found=0
   while IFS= read -r -d '' f; do
-    # Refuse un fichier corrompu/non-deb avant de l'intégrer (et de le signer).
-    dpkg-deb -I "$f" >/dev/null 2>&1 || die "fichier .deb invalide ou corrompu: $f"
-    import_package="$(dpkg-deb -f "$f" Package)"
-    for forbidden_pattern in $FORBIDDEN_PACKAGE_PATTERNS; do
-      if [[ "$import_package" == *"$forbidden_pattern"* ]]; then
-        die "paquet '${import_package}' refusé dans ce dépôt (${REPO_ROOT}).
-Utilise le générateur de dépôt correspondant; pour AuxiNuxOS:
-  sudo GPG_KEY='repo@auxinux.ca' ./build-depot-AuxiNuxOS.sh ${IMPORT_DIR}"
-      fi
-    done
     cp -fv "$f" "$KERNEL_DIR"/
     found=1
   done < <(find "$IMPORT_DIR" -maxdepth 1 -name '*.deb' -print0)
@@ -241,6 +253,25 @@ Utilise le générateur de dépôt correspondant; pour AuxiNuxOS:
 else
   echo "  (import_dir = kernel_dir, rien à copier)"
 fi
+
+# Validation appliquee a TOUT le contenu de KERNEL_DIR, pas seulement aux
+# fichiers importes: sans import (le cas par defaut, IMPORT_DIR=KERNEL_DIR),
+# l'ancienne version n'inspectait rien et signait tel quel ce qui trainait,
+# y compris un paquet etranger a ce depot depose lors d'un run precedent.
+echo "  Validation du contenu de KERNEL_DIR..."
+for f in "$KERNEL_DIR"/*.deb; do
+  [[ -e "$f" ]] || continue
+  dpkg-deb -I "$f" >/dev/null 2>&1 || die "fichier .deb invalide ou corrompu: $f"
+  pkg_name="$(dpkg-deb -f "$f" Package)"
+  for forbidden_pattern in $FORBIDDEN_PACKAGE_PATTERNS; do
+    if [[ "$pkg_name" == *"$forbidden_pattern"* ]]; then
+      die "paquet '${pkg_name}' refusé dans ce dépôt (${REPO_ROOT}).
+Fichier: $f
+Utilise le générateur de dépôt correspondant; pour AuxiNuxOS:
+  sudo GPG_KEY='repo@auxinux.ca' ./build-depot-AuxiNuxOS.sh ${IMPORT_DIR}"
+    fi
+  done
+done
 
 # Normalise TOUS les .deb au format APT canonique <Package>_<Version>_<Arch>.deb.
 # dpkg-scanpackages n'indexe de façon fiable que les fichiers nommés ainsi:
@@ -270,6 +301,35 @@ echo "[2/9] Purge des anciennes versions..."
 # Étape 2: pour chaque couple, retrouve tous ses fichiers, triés par version
 # croissante (sort -V sur la Version dpkg, chemin extrait ensuite via cut) ;
 # les plus anciens en excédent de $n sont supprimés.
+# Regroupe les paquets par SERIE plutot que par nom exact. Un noyau porte la
+# release complete dans son nom (linux-image-7.1.10-auxinux-virtua-amd64), donc
+# chaque release est un nom de paquet UNIQUE: grouper par nom laissait toujours
+# une seule version par groupe et la purge ne supprimait jamais rien.
+# On extrait donc (prefixe, flavour-arch) comme cle de serie et la version
+# upstream comme cle de tri.
+#   linux-image-7.1.10-auxinux-virtua-amd64      -> serie "linux-image-|-auxinux-virtua-amd64"      v=7.1.10
+#   linux-image-7.1.3-auxinux-virtua-amd64-dbg   -> serie "linux-image-|-auxinux-virtua-amd64-dbg"  v=7.1.3
+#   linux-headers-7.1.10-auxinux-virtua-amd64    -> serie "linux-headers-|-auxinux-virtua-amd64"    v=7.1.10
+# Les paquets non-noyau (meta, openzfs-zfs-dkms) gardent le tri par version dpkg.
+KVER_RE='^(linux-(image|headers)-)([0-9]+\.[0-9]+(\.[0-9]+)?(-rc[0-9]+)?)(-.+)$'
+
+series_key() {
+  if [[ "$1" =~ $KVER_RE ]]; then
+    printf '%s|%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[6]}"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
+sort_key() {
+  # Version upstream pour un noyau, version dpkg sinon.
+  if [[ "$1" =~ $KVER_RE ]]; then
+    printf '%s\n' "${BASH_REMATCH[3]}"
+  else
+    printf '%s\n' "$2"
+  fi
+}
+
 prune_old() {
   local n="$1"
   if (( n <= 0 )); then
@@ -277,36 +337,36 @@ prune_old() {
     return 0
   fi
 
-  local pkgs
-  pkgs="$(for f in "$KERNEL_DIR"/*.deb; do
-            [[ -e "$f" ]] || continue
-            printf '%s\t%s\n' "$(dpkg-deb -f "$f" Package)" "$(dpkg-deb -f "$f" Architecture)"
-          done | sort -u)"
+  # Index unique: serie <TAB> arch <TAB> cle-de-tri <TAB> chemin
+  local index
+  index="$(for f in "$KERNEL_DIR"/*.deb; do
+             [[ -e "$f" ]] || continue
+             local pk vr ar
+             pk="$(dpkg-deb -f "$f" Package)"; vr="$(dpkg-deb -f "$f" Version)"
+             ar="$(dpkg-deb -f "$f" Architecture)"
+             [[ -n "$pk" && -n "$ar" ]] || continue
+             printf '%s\t%s\t%s\t%s\n' "$(series_key "$pk")" "$ar" "$(sort_key "$pk" "$vr")" "$f"
+           done)"
+  [[ -n "$index" ]] || { echo "  (aucun paquet à purger)"; return 0; }
 
-  local p arch
-  while IFS=$'\t' read -r p arch; do
-    [[ -n "$p" ]] || continue
-    [[ -n "$arch" ]] || continue
+  local serie arch
+  while IFS=$'\t' read -r serie arch; do
+    [[ -n "$serie" ]] || continue
     local files=()
     mapfile -t files < <(
-      for f in "$KERNEL_DIR"/*.deb; do
-        [[ -e "$f" ]] || continue
-        if [[ "$(dpkg-deb -f "$f" Package)" == "$p" && "$(dpkg-deb -f "$f" Architecture)" == "$arch" ]]; then
-          printf '%s\t%s\n' "$(dpkg-deb -f "$f" Version)" "$f"
-        fi
-      done | sort -V | cut -f2-
+      awk -F'\t' -v s="$serie" -v a="$arch" '$1==s && $2==a {print $3"\t"$4}' <<< "$index" \
+        | sort -V | cut -f2-
     )
     local count=${#files[@]}
     if (( count > n )); then
-      local remove=$(( count - n ))
-      echo "  $p [$arch]: $count versions -> suppression des $remove plus anciennes"
-      local i
+      local remove=$(( count - n )) i
+      echo "  ${serie/|/*} [$arch]: $count versions -> suppression des $remove plus anciennes"
       for ((i=0; i<remove; i++)); do
         echo "    rm $(basename "${files[$i]}")"
         rm -f "${files[$i]}"
       done
     fi
-  done <<< "$pkgs"
+  done < <(cut -f1,2 <<< "$index" | sort -u)
 }
 
 prune_old "$KEEP_VERSIONS"
@@ -336,6 +396,12 @@ generate_meta_package() {
         linux-image-*-"${kernel_flavour}"-*-dbg) ;;
         linux-image-*-"${kernel_flavour}"-*-dbgsym) ;;
         linux-image-*-"${kernel_flavour}"-*)
+          # Anti-fuite entre canaux: le glob "*" qui precede le flavour
+          # matcherait aussi "7.2.2-dev-auxinux-virtua". En canal prod on
+          # ignore donc explicitement tout paquet portant le marqueur dev.
+          if [[ "$kernel_flavour" != dev-* && "$pkg" == *-dev-* ]]; then
+            continue
+          fi
           printf '%s\t%s\t%s\n' "$version" "$pkg" "$f"
           ;;
       esac
@@ -587,12 +653,12 @@ if [[ "$SIGN" == "1" ]]; then
   echo "  sudo wget -O /usr/share/keyrings/${KEYRING_BASENAME}.gpg \\"
   echo "       ${PUBLIC_REPO_URL}/${KEYRING_BASENAME}.gpg"
   echo
-  echo "  echo 'deb [signed-by=/usr/share/keyrings/${KEYRING_BASENAME}.gpg arch=amd64,arm64] ${PUBLIC_REPO_URL} kernel main' \\"
+  echo "  echo 'deb [signed-by=/usr/share/keyrings/${KEYRING_BASENAME}.gpg arch=amd64,arm64] ${PUBLIC_REPO_URL} ${DIST} main' \\"
   echo "       | sudo tee /etc/apt/sources.list.d/${SOURCES_LIST_NAME}.list"
   echo
 else
   echo "Configuration côté client (non signé):"
-  echo "  deb [trusted=yes arch=amd64,arm64] ${PUBLIC_REPO_URL} kernel main"
+  echo "  deb [trusted=yes arch=amd64,arm64] ${PUBLIC_REPO_URL} ${DIST} main"
   echo
 fi
 

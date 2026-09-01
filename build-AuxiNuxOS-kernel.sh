@@ -69,6 +69,7 @@ for arg in "$@"; do
     channel=*) CHANNEL="${arg#*=}" ;;
     --branch=*) BRANCH="${arg#*=}" ;;
     branch=*) BRANCH="${arg#*=}" ;;
+    track=*|--track=*|-dev|--dev-track|-prod|--prod-track) PASSTHROUGH+=("$arg") ;;
     --current|--stable|--latest) CHANNEL="current" ;;
     --lts|--longterm) CHANNEL="lts" ;;
     --mainline|--dev) CHANNEL="mainline" ;;
@@ -85,6 +86,9 @@ for arg in "$@"; do
 done
 
 # A workstation kernel does not need kernel-coupled OpenZFS modules by default.
+# WITH_ZFS fourni par l'environnement compte aussi comme un choix explicite:
+# sinon le "no-zfs" implicite ci-dessous l'ecrasait silencieusement.
+[[ -n "${WITH_ZFS:-}" ]] && ZFS_OPTION_SET=1
 (( ZFS_OPTION_SET == 1 )) || PASSTHROUGH+=("no-zfs")
 
 case "$CHANNEL" in

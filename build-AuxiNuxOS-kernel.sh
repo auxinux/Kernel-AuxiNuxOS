@@ -69,7 +69,9 @@ for arg in "$@"; do
     channel=*) CHANNEL="${arg#*=}" ;;
     --branch=*) BRANCH="${arg#*=}" ;;
     branch=*) BRANCH="${arg#*=}" ;;
-    track=*|--track=*|-dev|--dev-track|-prod|--prod-track) PASSTHROUGH+=("$arg") ;;
+    # Uniquement la forme track=... ici: les alias courts -dev/-prod seraient
+    # confondus avec --dev, qui designe deja le canal mainline ci-dessous.
+    track=*|--track=*|RELEASE_TRACK=*) PASSTHROUGH+=("$arg") ;;
     --current|--stable|--latest) CHANNEL="current" ;;
     --lts|--longterm) CHANNEL="lts" ;;
     --mainline|--dev) CHANNEL="mainline" ;;

@@ -80,6 +80,11 @@ KERNELORG_BASE_URL="https://cdn.kernel.org/pub/linux/kernel"
 # headers du kernel cible ne sont pas installés — d'où l'appariement strict
 # avec linux-headers-<release> côté paquet meta (build-depot-kernel-core.sh).
 # OpenZFS 2.4.2+ supporte le kernel 7.0 (range 4.18 -> 7.0).
+# Infos de debug. 0 (defaut) = noyau leger, pas de paquet -dbg.
+# 1 = DWARF + BTF, requis par l'eBPF CO-RE (bpftrace, Falco, Cilium) mais
+# produit un -dbg de ~1.7 Go et rallonge sensiblement la compilation.
+WITH_DEBUG_INFO="${WITH_DEBUG_INFO:-0}"
+
 WITH_ZFS="${WITH_ZFS:-auto}"          # auto = activé sur amd64 natif, sinon off
 ZFS_VERSION="${ZFS_VERSION:-2.4.2}"   # version OpenZFS qui supporte 7.0
 ZFS_BASE_URL="${ZFS_BASE_URL:-https://github.com/openzfs/zfs/releases/download}"
@@ -206,6 +211,9 @@ Options:
   CROSS_COMPILE=prefix       Override cross compiler prefix.
   META_PACKAGE=name          Override the meta-package suggested in README.
   VIRTUA_BUILD_NUMBER=n      Increment when rebuilding the same upstream version.
+  WITH_DEBUG_INFO=0|1        Infos de debug DWARF + BTF. Défaut 0 (noyau léger,
+                             pas de paquet -dbg). Mettre 1 si tu as besoin de
+                             l'eBPF CO-RE (bpftrace, Falco) ou des crash dumps.
   JOBS=n                     Parallel make jobs. Default: nproc.
   BUILD_ROOT=/path           Build workspace. Default: /usr/src/auxinuxos-kernel-build.
   OUTPUT_DIR=/path           Output directory for generated .deb files.
@@ -1069,8 +1077,18 @@ cfg --set-str SYSTEM_TRUSTED_KEYS ""
 cfg --set-str SYSTEM_REVOCATION_KEYS ""
 
 # --- Réduction de taille (gain principal) ---
-cfg --disable DEBUG_INFO
-cfg --disable DEBUG_INFO_BTF
+# Depuis Linux 5.18, CONFIG_DEBUG_INFO n'est PLUS selectionnable directement:
+# c'est un bool "select" par un choice (DEBUG_INFO_NONE vs les variantes DWARF).
+# Un `--disable DEBUG_INFO` etait donc silencieusement annule par olddefconfig
+# -> DEBUG_INFO restait a y et bindeb-pkg produisait un -dbg de ~1.7 Go, alors
+# que ce bloc est cense reduire la taille. Il faut passer par l'option NONE.
+if [[ "$WITH_DEBUG_INFO" == "1" ]]; then
+  cfg --enable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
+  cfg --enable DEBUG_INFO_BTF
+else
+  cfg --enable DEBUG_INFO_NONE
+  cfg --disable DEBUG_INFO_BTF
+fi
 
 if [[ "$PROFILE" == "virtua" ]]; then
 
@@ -1391,6 +1409,16 @@ done
 (( ${#missing_crit[@]} == 0 )) || \
   die "options CRITIQUES absentes après olddefconfig: ${missing_crit[*]}
 Vérifie le .config et les dépendances. Build interrompu."
+
+# cfg() ignore les erreurs: sans ce controle, une option devenue non
+# selectionnable retombe silencieusement sur la valeur de la config de base.
+if [[ "$WITH_DEBUG_INFO" == "1" ]]; then
+  opt_on DEBUG_INFO_BTF || echo "AVERTISSEMENT: WITH_DEBUG_INFO=1 mais CONFIG_DEBUG_INFO_BTF absent (eBPF CO-RE indisponible)."
+elif grep -q '^CONFIG_DEBUG_INFO=y' .config; then
+  die "CONFIG_DEBUG_INFO=y alors que WITH_DEBUG_INFO=0.
+La désactivation n'a pas pris: vérifie CONFIG_DEBUG_INFO_NONE dans .config.
+Sans ça le build produit un paquet -dbg de ~1.7 Go et dure bien plus longtemps."
+fi
 
 echo "Config OK — toutes les options critiques sont présentes."
 

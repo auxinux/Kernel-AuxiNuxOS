@@ -1570,7 +1570,10 @@ done
 case "$PROFILE" in
   auxinuxos)
     README_REPO_LABEL="AuxiNuxOS Kernel Repository"
-    README_APT_URL="https://dep.auxinux.ca/AUXINUXOS/KERNEL"
+    # Racine APT = REPO_ROOT (qui contient dists/ et le keyring), PAS le
+    # sous-dossier KERNEL/ qui ne contient que les .deb. Avec /KERNEL, apt
+    # cherchait .../AUXINUXOS/KERNEL/dists/kernel/InRelease -> 404.
+    README_APT_URL="https://dep.auxinux.ca/AUXINUXOS"
     README_KEYRING="auxinuxos-archive-keyring"
     ;;
   *)

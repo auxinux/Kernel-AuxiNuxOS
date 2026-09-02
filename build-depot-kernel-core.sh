@@ -451,7 +451,16 @@ generate_meta_package() {
       pkg="$(dpkg-deb -f "$f" Package)"
       pkg_arch="$(dpkg-deb -f "$f" Architecture)"
       [[ "$pkg_arch" == "$deb_arch" || "$pkg_arch" == "all" ]] || continue
-      [[ "$pkg" == "openzfs-zfs-dkms" ]] && { echo "$pkg"; break; }
+      # `if` plutot que `[[ ]] && { ... }`: sous set -e, une assignation nue
+      # var=$(...) propage le statut de la DERNIERE commande de la boucle. Sans
+      # paquet ZFS (cas AuxiNuxOS, qui n'en publie jamais), le [[ ]] final est
+      # toujours faux -> `&&` renvoie 1 -> l'assignation "echoue" -> le script
+      # sort en silence (pas de die(), donc pas de message). `if` sans `else`
+      # renvoie toujours 0 que la condition soit vraie ou fausse.
+      if [[ "$pkg" == "openzfs-zfs-dkms" ]]; then
+        echo "$pkg"
+        break
+      fi
     done
   )"
   if [[ -n "$zfs_pkg" && "$ZFS_META_DEP" != "none" && -z "$header_version" ]]; then

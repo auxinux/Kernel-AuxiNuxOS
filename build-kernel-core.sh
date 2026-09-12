@@ -2,8 +2,11 @@
 set -Eeuo pipefail
 
 # ============================================================
-# Virtua Kernel Builder
-# Hyperviseur Virtua (KVM/QEMU + LXC + Docker)
+# AuxiNux Kernel Builder
+# profile=auxinuxos : station DESKTOP AuxiNuxOS (COSMIC/Wayland)
+#                     + LXC/Docker + KVM, rollback BTRFS, ZRAM,
+#                     GPU Intel/AMD/NVIDIA, bureautique/multimédia/jeu
+# profile=virtua    : hyperviseur Virtua (KVM/QEMU + LXC + Docker)
 # Base: Debian 13 / Trixie
 # ============================================================
 #
@@ -85,6 +88,12 @@ KERNELORG_BASE_URL="https://cdn.kernel.org/pub/linux/kernel"
 # produit un -dbg de ~1.7 Go et rallonge sensiblement la compilation.
 WITH_DEBUG_INFO="${WITH_DEBUG_INFO:-0}"
 
+# Build à blanc: applique et VÉRIFIE la configuration, puis s'arrête avant la
+# compilation. C'est le mode à utiliser pour valider une nouvelle série de
+# noyaux (7.1 -> 7.2) sans payer une heure de compilation pour découvrir
+# qu'un symbole a été renommé.
+CONFIG_ONLY="${CONFIG_ONLY:-0}"
+
 WITH_ZFS="${WITH_ZFS:-auto}"          # auto = activé sur amd64 natif, sinon off
 ZFS_VERSION="${ZFS_VERSION:-2.4.2}"   # version OpenZFS qui supporte 7.0
 ZFS_BASE_URL="${ZFS_BASE_URL:-https://github.com/openzfs/zfs/releases/download}"
@@ -138,7 +147,12 @@ Profiles:
       Supported architectures: amd64, arm64.
 
   profile=auxinuxos
-      AuxiNuxOS workstation kernel for COSMIC/Wayland on bare metal or in a VM.
+      AuxiNuxOS DESKTOP workstation kernel: COSMIC/Wayland on bare metal or in
+      a VM, tuned for office, multimedia and gaming on the same machine, with
+      LXC/Docker and KVM kept intact.
+      Includes: Intel/AMD/NVIDIA GPU stack, ZRAM, MGLRU, PSI (systemd-oomd),
+      full preemption at 1000 Hz, BFQ, ntsync (Wine/Proton), game controllers,
+      SOF audio, and the built-ins required by the AuxiNuxOS BTRFS rollback.
       Produces: X.X.X-auxinuxos-ARCH
       Recommended meta-package: kernel-auxinuxos
       Supported architectures: amd64, arm64.
@@ -211,9 +225,16 @@ Options:
   CROSS_COMPILE=prefix       Override cross compiler prefix.
   META_PACKAGE=name          Override the meta-package suggested in README.
   VIRTUA_BUILD_NUMBER=n      Increment when rebuilding the same upstream version.
-  WITH_DEBUG_INFO=0|1        Infos de debug DWARF + BTF. Défaut 0 (noyau léger,
-                             pas de paquet -dbg). Mettre 1 si tu as besoin de
-                             l'eBPF CO-RE (bpftrace, Falco) ou des crash dumps.
+  WITH_DEBUG_INFO=0|1        Infos de debug DWARF + BTF. Défaut 0 (noyau léger).
+                             Sans effet sur profile=auxinuxos, où BTF est
+                             toujours activé (défaut Debian 13, requis par
+                             l'eBPF CO-RE des conteneurs). Le paquet -dbg
+                             produit au passage n'est jamais publié.
+  -config-only               Build à blanc: applique et VÉRIFIE la config
+                             ([6a] indexe les symboles Kconfig de l'arbre et
+                             refuse tout symbole inexistant), puis s'arrête
+                             avant la compilation. À utiliser à chaque
+                             changement de série de noyau.
   JOBS=n                     Parallel make jobs. Default: nproc.
   BUILD_ROOT=/path           Build workspace. Default: /usr/src/auxinuxos-kernel-build.
   OUTPUT_DIR=/path           Output directory for generated .deb files.
@@ -243,6 +264,7 @@ Examples:
   $0 KERNEL_VERSION=6.12.31
   $0 profile=desktop -arch=arm64 KERNEL_VERSION=6.12.31 JOBS=8
   $0 source=debian KERNEL_MAJOR=6.12
+  $0 profile=auxinuxos KERNEL_VERSION=7.2.5 -config-only   # build à blanc
   $0 ZFS_SHA256=<hash>                 # build + modules ZFS 2.4.2 vérifiés
   $0 no-zfs                            # kernel seul, sans modules ZFS
   $0 profile=all -docker               # build dans un conteneur debian:13 amd64
@@ -385,6 +407,7 @@ for arg in "$@"; do
     --arch=*) TARGET_ARCH="${arg#*=}" ;;
     arch=*) TARGET_ARCH="${arg#*=}" ;;
     TARGET_ARCH=*) TARGET_ARCH="${arg#*=}" ;;
+    -config-only|--config-only|config-only) CONFIG_ONLY=1 ;;
     -check-debian|--check-debian) MODE="check"; SOURCE="debian" ;;
     -check-kernelorg|--check-kernelorg) MODE="check"; SOURCE="kernelorg" ;;
     KERNEL_MAJOR=*) KERNEL_MAJOR="${arg#*=}" ;;
@@ -587,7 +610,46 @@ fi
 # Helpers
 # ============================================================
 
-cfg() { ./scripts/config "$@" || true; }
+# Table des options demandées par les blocs de configuration plus bas.
+# Format: "SYMBOLE<TAB>ACTION<TAB>VALEUR_ATTENDUE". Elle est rejouée par
+# l'étape [6a], qui vérifie que CHAQUE option demandée existe réellement dans
+# cette version du noyau ET qu'elle a bien été retenue par olddefconfig.
+CFG_REQUESTS=()
+
+# NE JAMAIS remettre "|| true" ici.
+# scripts/config accepte sans broncher un symbole inexistant: il écrit la ligne
+# dans .config, qu'olddefconfig supprime ensuite en silence. Un symbole renommé
+# entre deux versions du noyau devenait donc un no-op parfaitement invisible.
+# Le passage de 7.1 à 7.2 en a révélé trois dans ce script (CGROUP_NS, MT76,
+# ATH12K_PCI), dont deux sur le profil desktop AuxiNuxOS.
+cfg() {
+  local action="${1:-}" sym="${2:-}" expect
+  case "$action" in
+    --enable)  expect="y" ;;
+    --module)  expect="m" ;;
+    --disable) expect="n" ;;
+    --set-str) expect="str:${3-}" ;;
+    --set-val) expect="val:${3-}" ;;
+    *) die "cfg(): action non supportée: '${action}' (symbole ${sym:-?})." ;;
+  esac
+  [[ -n "$sym" ]] || die "cfg(): symbole manquant pour l'action ${action}."
+  CFG_REQUESTS+=("${sym}"$'\t'"${action}"$'\t'"${expect}")
+  ./scripts/config "$@" \
+    || die "scripts/config a échoué: $* (arbre source incohérent?)"
+}
+
+# Valeur réellement présente dans .config pour un symbole (diagnostic).
+cfg_actual() {
+  local line
+  line="$(grep -m1 "^CONFIG_${1}=" .config || true)"
+  if [[ -n "$line" ]]; then
+    echo "${line#*=}"
+  elif grep -q "^# CONFIG_${1} is not set\$" .config; then
+    echo "n"
+  else
+    echo "non défini"
+  fi
+}
 
 is_supported_debian13_base() {
   case "${ID:-}" in
@@ -1076,19 +1138,55 @@ cfg --disable LOCALVERSION_AUTO
 cfg --set-str SYSTEM_TRUSTED_KEYS ""
 cfg --set-str SYSTEM_REVOCATION_KEYS ""
 
-# --- Réduction de taille (gain principal) ---
-# Depuis Linux 5.18, CONFIG_DEBUG_INFO n'est PLUS selectionnable directement:
+# --- Infos de debug et BTF --------------------------------------------------
+# Depuis Linux 5.18, CONFIG_DEBUG_INFO n'est PLUS sélectionnable directement:
 # c'est un bool "select" par un choice (DEBUG_INFO_NONE vs les variantes DWARF).
-# Un `--disable DEBUG_INFO` etait donc silencieusement annule par olddefconfig
-# -> DEBUG_INFO restait a y et bindeb-pkg produisait un -dbg de ~1.7 Go, alors
-# que ce bloc est cense reduire la taille. Il faut passer par l'option NONE.
-if [[ "$WITH_DEBUG_INFO" == "1" ]]; then
+# Un `--disable DEBUG_INFO` était donc silencieusement annulé par olddefconfig.
+# Il faut passer par l'option NONE.
+#
+# Sur le profil auxinuxos, BTF est activé d'office: c'est le défaut Debian 13,
+# et tout l'outillage eBPF CO-RE d'observation des conteneurs (bpftrace, Docker,
+# LXC) en dépend. AuxiNuxOS conserve justement Docker et LXC.
+#
+# ATTENTION à la contrainte Kconfig (lib/Kconfig.debug):
+#     config DEBUG_INFO_BTF
+#         depends on !DEBUG_INFO_SPLIT && !DEBUG_INFO_REDUCED
+# BTF et DEBUG_INFO_REDUCED sont MUTUELLEMENT EXCLUSIFS: il faut du DWARF
+# complet. Le surcoût est du temps de build et un gros vmlinux intermédiaire,
+# PAS un gros vmlinuz: seul le BTF dédupliqué (~4-6 Mo) part dans l'image.
+# Le paquet linux-image-*-dbg produit au passage n'est jamais publié ([8/9]).
+if [[ "$PROFILE" == "auxinuxos" || "$WITH_DEBUG_INFO" == "1" ]]; then
+  cfg --disable DEBUG_INFO_NONE
   cfg --enable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
+  cfg --disable DEBUG_INFO_REDUCED
+  cfg --disable DEBUG_INFO_SPLIT
   cfg --enable DEBUG_INFO_BTF
+  cfg --enable DEBUG_INFO_BTF_MODULES
 else
   cfg --enable DEBUG_INFO_NONE
   cfg --disable DEBUG_INFO_BTF
 fi
+
+# --- Compression: kernel et modules ----------------------------------------
+cfg --enable KERNEL_ZSTD
+cfg --enable MODULE_COMPRESS
+cfg --enable MODULE_COMPRESS_ZSTD
+
+# --- Modules hors-arbre (DKMS): gardes OBLIGATOIRES -------------------------
+# Sur une station AuxiNuxOS, les modules DKMS ne sont pas une hypothèse: le
+# pilote NVIDIA propriétaire, VirtualBox, v4l2loopback et OpenZFS passent tous
+# par là.
+#
+# TRIM_UNUSED_KSYMS élague les symboles exportés non utilisés en interne et
+# casse la compilation de TOUT module hors-arbre. Un échec DKMS ne fait PAS
+# échouer apt: l'utilisateur se retrouve avec un paquet installé, aucun module,
+# et aucun message d'erreur — typiquement un poste NVIDIA qui redémarre en
+# 800x600 sans que rien n'ait signalé de panne.
+cfg --disable TRIM_UNUSED_KSYMS
+# Un module DKMS est non signé: MODULE_SIG_FORCE l'empêcherait de charger.
+cfg --disable MODULE_SIG_FORCE
+cfg --enable MODVERSIONS
+cfg --enable MODULE_UNLOAD
 
 if [[ "$PROFILE" == "virtua" ]]; then
 
@@ -1101,7 +1199,7 @@ cfg --enable KVM_XEN
 cfg --enable VFIO
 cfg --enable VFIO_PCI
 cfg --enable VFIO_IOMMU_TYPE1
-cfg --enable VFIO_MDEV
+# VFIO_MDEV: tristate sans prompt, auto-sélectionné par les pilotes mdev.
 cfg --enable IOMMUFD           # interface moderne QEMU/VFIO
 cfg --enable VFIO_DEVICE_CDEV  # exposition VFIO via iommufd
 cfg --enable PCI_STUB           # bind device pour passthrough
@@ -1176,7 +1274,6 @@ cfg --enable NET_NS
 cfg --enable PID_NS
 cfg --enable IPC_NS
 cfg --enable UTS_NS
-cfg --enable CGROUP_NS
 cfg --enable TIME_NS
 cfg --enable OVERLAY_FS
 cfg --enable SECCOMP
@@ -1237,7 +1334,7 @@ cfg --disable DRM_RADEON
 cfg --disable DRM_XE
 cfg --disable DRM_I915
 
-else
+elif [[ "$PROFILE" == "desktop" ]]; then
 
 # --- Desktop / VM desktop ---
 # Le profil desktop reste proche de la config Debian et ne retire pas les GPU.
@@ -1258,7 +1355,7 @@ cfg --module KVM_INTEL
 cfg --module KVM_AMD
 
 cfg --enable DRM
-cfg --enable DRM_KMS_HELPER
+# DRM_KMS_HELPER suit les pilotes qui le sélectionnent: pas de cfg() dessus.
 cfg --module DRM_I915
 cfg --module DRM_XE
 cfg --module DRM_AMDGPU
@@ -1290,51 +1387,713 @@ cfg --module BTRFS_FS
 cfg --module XFS_FS
 cfg --module F2FS_FS
 
-if [[ "$PROFILE" == "auxinuxos" ]]; then
-  # COSMIC et Wayland sont en espace utilisateur; leur prérequis noyau est un
-  # chemin DRM/KMS, input, audio et radio complet.
+elif [[ "$PROFILE" == "auxinuxos" ]]; then
+  # ==========================================================================
+  # AuxiNuxOS — station de travail Debian 13 / COSMIC / Wayland
+  # ==========================================================================
+  # Cahier des charges: bureautique, multimédia et jeu sur le même noyau, sans
+  # perdre LXC ni Docker, avec le rollback BTRFS d'AuxiNuxOS comme contrainte
+  # de premier ordre. Tout ce qui suit est vérifié par l'étape [6a].
+
+  # --- Affichage: console visible dès la première seconde -------------------
+  # Un poste qui démarre sans pilote d'affichage n'est pas "lent", il est NOIR,
+  # et c'est rapporté comme un plantage. DRM, simpledrm et le framebuffer
+  # console sont donc built-in: l'écran vit avant que le moindre module soit
+  # chargé, y compris quand on démarre sur un instantané de restauration.
   cfg --enable VT
   cfg --enable VT_CONSOLE
   cfg --enable FRAMEBUFFER_CONSOLE
-  cfg --enable DRM_DISPLAY_HELPER
+  cfg --enable FRAMEBUFFER_CONSOLE_DETECT_PRIMARY
+  # Plymouth reprend la main sans faire clignoter la console au passage.
+  cfg --enable FRAMEBUFFER_CONSOLE_DEFERRED_TAKEOVER
+  cfg --enable SYSFB_SIMPLEFB
+  cfg --enable DRM
   cfg --enable DRM_FBDEV_EMULATION
   cfg --enable DRM_SIMPLEDRM
+  cfg --enable VGA_ARB
   cfg --enable BACKLIGHT_CLASS_DEVICE
+  cfg --module ACPI_VIDEO
+
+  # --- GPU Intel ------------------------------------------------------------
+  # i915 couvre de Gen2 à Meteor Lake, xe prend Lunar Lake / Battlemage et la
+  # suite. Les deux coexistent: chacun se lie aux PCI ID qu'il revendique.
+  # En MODULES, obligatoirement: ces pilotes réclament du firmware dans
+  # /lib/firmware à l'initialisation, qu'un pilote built-in ne peut pas
+  # attendre. C'est aussi ce que fait Debian.
+  cfg --module DRM_I915
+  cfg --module DRM_XE
+
+  # --- GPU AMD --------------------------------------------------------------
+  # DRM_AMD_DC (Display Core) n'est pas optionnel sur AMD moderne: sans lui,
+  # amdgpu se charge mais ne pilote aucun écran sur tout ce qui est postérieur
+  # à Vega — écran noir avec le bon pilote en mémoire.
+  cfg --module DRM_AMDGPU
+  cfg --enable DRM_AMD_DC
+  cfg --enable DRM_AMDGPU_USERPTR
+  # SI/CIK: GCN 1 et 2 (HD 7000, R7/R9 200/300, APU Kaveri). Sans ces deux
+  # options, ces cartes retombent sur radeon — et RADV, le pilote Vulkan de
+  # Mesa, ne fonctionne qu'au-dessus d'amdgpu.
+  cfg --enable DRM_AMDGPU_SI
+  cfg --enable DRM_AMDGPU_CIK
+  # radeon reste pour TeraScale (HD 2000-6000), antérieur à GCN.
+  cfg --module DRM_RADEON
+
+  # --- GPU NVIDIA -----------------------------------------------------------
+  # Deux chemins, tous deux à préserver:
+  #  1. nouveau, libre, dans l'arbre — le pilote par défaut à l'installation.
+  #  2. le pilote propriétaire NVIDIA, hors arbre, compilé par DKMS chez
+  #     l'utilisateur. Il ne dépend d'aucune option DRM_NVIDIA (il n'y en a
+  #     pas) mais EXIGE les gardes DKMS du bloc commun plus haut:
+  #     TRIM_UNUSED_KSYMS=n, MODULE_SIG_FORCE=n, MODVERSIONS=y, MODULE_UNLOAD=y
+  #     — plus DRM_FBDEV_EMULATION pour nvidia-drm.modeset=1.
+  cfg --module DRM_NOUVEAU
+  cfg --enable DRM_NOUVEAU_BACKLIGHT
+
+  # --- Affichages émulés: AuxiNuxOS testé et installé en machine virtuelle ---
+  cfg --module DRM_VIRTIO_GPU
+  cfg --module DRM_VMWGFX
+  cfg --module DRM_QXL
+  cfg --module DRM_BOCHS
+
+  # --- Entrées: clavier, souris, pavé tactile, tablette ---------------------
+  # libinput ne lit QUE evdev: c'est la seule interface d'entrée qui compte
+  # sous Wayland. INPUT_UINPUT est requis par les outils de remappage et
+  # d'accessibilité (ydotool, wlrctl, claviers virtuels COSMIC).
+  cfg --enable INPUT_EVDEV
+  cfg --enable INPUT_UINPUT
+  cfg --module INPUT_FF_MEMLESS
+  cfg --enable HID
+  cfg --enable HID_GENERIC
+  cfg --enable USB_HID
+  cfg --module HID_MULTITOUCH
+  cfg --module I2C_HID
+  cfg --module I2C_HID_ACPI
+  cfg --module HID_APPLE
+  cfg --module HID_WACOM
+  cfg --module HID_LOGITECH
+  cfg --module HID_LOGITECH_DJ
+  cfg --module HID_LOGITECH_HIDPP
+  cfg --module HID_MICROSOFT
+  cfg --module HID_ASUS
+  cfg --module HID_LENOVO
+  cfg --module HID_CORSAIR
+  # Clavier PS/2: encore présent sur les tours et les portables d'avant 2013,
+  # et seul moyen d'atteindre le menu GRUB de restauration sur ces machines.
+  cfg --enable SERIO_I8042
+  cfg --enable KEYBOARD_ATKBD
+  cfg --module MOUSE_PS2
+
+  # --- Jeu: manettes --------------------------------------------------------
+  # INPUT_JOYDEV fournit /dev/input/jsX, encore attendu par une partie du
+  # catalogue Proton; evdev seul ne suffit pas pour ces titres.
+  cfg --enable INPUT_JOYSTICK
+  cfg --module INPUT_JOYDEV
+  cfg --module JOYSTICK_XPAD          # Xbox 360 / One / Series
+  cfg --enable JOYSTICK_XPAD_FF       # retour de force
+  cfg --enable JOYSTICK_XPAD_LEDS
+  cfg --module HID_SONY               # DualShock 3/4
+  cfg --module HID_PLAYSTATION        # DualSense (PS5)
+  cfg --module HID_NINTENDO           # Switch Pro / Joy-Con
+  cfg --module HID_STEAM              # manette Steam, Steam Deck
+
+  # --- Jeu: primitives de synchronisation NT (Wine / Proton) ----------------
+  # ntsync implémente en noyau les objets de synchronisation Windows
+  # (mutex, semaphore, event). Il remplace esync/fsync, qui émulaient ces
+  # objets avec des eventfd et des futex: moins d'appels système et surtout
+  # plus de plafond de descripteurs de fichiers à relever à la main.
+  # C'est l'option "jeu" la plus rentable disponible dans un noyau 7.2.
+  cfg --module NTSYNC
+
+  # --- Audio ----------------------------------------------------------------
+  # PipeWire ne remplace pas ALSA, il s'appuie dessus: sans le bon codec HDA,
+  # il n'y a simplement aucun périphérique à router.
+  cfg --enable SOUND
+  cfg --enable SND
+  cfg --enable SND_DYNAMIC_MINORS
+  cfg --enable SND_SEQUENCER
+  cfg --module SND_SEQ_DUMMY
+  cfg --module SND_HRTIMER
+  cfg --module SND_HDA_INTEL
+  cfg --module SND_HDA_CODEC_REALTEK
+  cfg --module SND_HDA_CODEC_HDMI
+  cfg --module SND_HDA_CODEC_ANALOG
+  cfg --module SND_HDA_CODEC_SIGMATEL
+  cfg --module SND_HDA_CODEC_VIA
+  cfg --module SND_HDA_CODEC_CONEXANT
+  cfg --module SND_HDA_CODEC_CIRRUS
+  cfg --module SND_HDA_CODEC_CS8409
+  # Amplificateurs de haut-parleurs des portables récents (Dell, Lenovo, HP):
+  # sans ces deux modules le son sort, mais à un volume inaudible.
+  cfg --module SND_HDA_SCODEC_CS35L41_I2C
+  cfg --module SND_HDA_SCODEC_CS35L56_I2C
+  cfg --module SND_USB_AUDIO
+  # SOF: toute la génération Intel post-2019 (Tiger Lake et suivants) et les
+  # APU AMD récents n'ont plus de codec HDA classique. Sans SOF, ces portables
+  # n'ont AUCUNE sortie audio.
+  cfg --module SND_SOC
+  cfg --enable SND_SOC_SOF_TOPLEVEL
+  cfg --enable SND_SOC_SOF_INTEL_TOPLEVEL
+  cfg --enable SND_SOC_SOF_HDA_AUDIO_CODEC
+  cfg --module SND_SOC_SOF_AMD_TOPLEVEL
+  cfg --module SND_SOC_INTEL_SOUNDWIRE_SOF_MACH
+  cfg --module SOUNDWIRE
+  cfg --module SOUNDWIRE_INTEL
+
+  # --- Multimédia: webcam ---------------------------------------------------
+  # Le décodage vidéo matériel (VA-API) passe par i915/amdgpu/nouveau, pas par
+  # une option dédiée: il est déjà couvert par les blocs GPU ci-dessus.
+  cfg --module MEDIA_SUPPORT
+  cfg --enable MEDIA_USB_SUPPORT
+  cfg --enable MEDIA_CONTROLLER
+  cfg --module USB_VIDEO_CLASS
+  cfg --module USB_GSPCA
+
+  # ==========================================================================
+  # Fluidité
+  # ==========================================================================
+  # --- Ordonnancement et préemption -----------------------------------------
+  # En 7.2, sur x86, le choix du modèle de préemption a changé: x86 sélectionne
+  # ARCH_HAS_PREEMPT_LAZY, ce qui rend PREEMPT_VOLUNTARY *indisponible* et fait
+  # de PREEMPT_LAZY le défaut. Le seul autre choix possible est PREEMPT, la
+  # préemption complète — décrite par le Kconfig comme "Low-Latency Desktop".
+  #
+  # On prend PREEMPT: c'est la latence la plus basse, ce qui se voit exactement
+  # là où l'utilisateur regarde (pointeur sous charge, absence de coupure audio
+  # PipeWire, régularité des images en jeu). Le coût est quelques pourcents de
+  # débit sur une compilation.
+  # PREEMPT_DYNAMIC garde la porte ouverte: `preempt=lazy` au boot rend le débit
+  # sans rebuild, pour une machine qui compile plus qu'elle ne joue.
+  cfg --enable PREEMPT
+  cfg --enable PREEMPT_DYNAMIC
+  # 1000 Hz: "the preferred choice for desktop systems" (kernel/Kconfig.hz).
+  # Debian livre 250 Hz, un compromis orienté serveur.
+  cfg --enable HZ_1000
+  cfg --enable HIGH_RES_TIMERS
+  # NO_HZ: on garde délibérément le réglage Debian (NO_HZ_FULL). Sans
+  # `nohz_full=` sur la ligne de commande, son comportement est celui de
+  # NO_HZ_IDLE — le suivi de contexte est derrière une static key inactive.
+  # Forcer NO_HZ_IDLE ne gagnerait rien et retirerait une possibilité.
+  #
+  # SCHED_AUTOGROUP: regroupe les tâches par session. C'est LA fonctionnalité
+  # qui empêche un `make -j32` de rendre le bureau inutilisable. Le profil
+  # hyperviseur la coupe (elle fausse l'équité entre conteneurs); sur un poste
+  # de travail c'est exactement l'inverse.
+  cfg --enable SCHED_AUTOGROUP
+  cfg --enable SCHED_MC
+  cfg --enable SCHED_MC_PRIO          # Turbo Boost Max 3.0: cœurs favoris
+  cfg --enable SCHED_SMT
+  cfg --enable SCHED_CLUSTER          # chiplets Zen, cœurs E/P Intel
+  # uclamp: permet de plancher la fréquence demandée par une tâche. C'est ce
+  # qui évite que schedutil laisse un jeu tourner à basse fréquence parce que
+  # sa charge CPU paraît modeste.
+  cfg --enable UCLAMP_TASK
+  cfg --enable UCLAMP_TASK_GROUP
+
+  # --- Fluidité: mémoire ----------------------------------------------------
+  # ZRAM — demandé explicitement, et de loin le levier le plus rentable sur
+  # une machine à 4-8 Go. Livré en MODULE parce que c'est ce qu'attend
+  # zram-tools (paquet Debian) qui le configure via /etc/default/zramswap:
+  # son ExecStop réinitialise le périphérique, ce qu'un built-in complique.
+  cfg --module ZRAM
+  cfg --enable ZRAM_BACKEND_ZSTD
+  cfg --enable ZRAM_BACKEND_LZ4
+  cfg --enable ZRAM_DEF_COMP_ZSTD     # aligné sur ALGO=zstd d'AuxiNuxOS
+  cfg --enable ZRAM_MULTI_COMP
+  cfg --enable ZRAM_WRITEBACK         # pages incompressibles renvoyées au disque
+  cfg --enable SWAP
+
+  # ZSWAP: compilé mais INERTE par défaut. Empiler zswap devant un swap zram
+  # revient à compresser deux fois les mêmes pages, pour un résultat plus lent
+  # que sans. On le laisse disponible pour une installation sans zram.
+  cfg --enable ZSWAP
+  cfg --enable ZSWAP_COMPRESSOR_DEFAULT_ZSTD
+  cfg --disable ZSWAP_DEFAULT_ON
+
+  # MGLRU: remplacement de l'algorithme de réclamation de pages. Son gain se
+  # voit précisément dans le cas qui exaspère l'utilisateur — la machine qui
+  # arrive à saturation mémoire et devient pâteuse au lieu de rester utilisable.
+  cfg --enable LRU_GEN
+  cfg --enable LRU_GEN_ENABLED
+
+  # PSI: prérequis ABSOLU de systemd-oomd, qui est la deuxième mesure de
+  # fluidité d'AuxiNuxOS (docs/performance.md). Sans PSI, le service démarre,
+  # ne lit aucune pression et ne tue jamais rien: la machine gèle quand même.
+  # PSI_DEFAULT_DISABLED=n pour ne pas dépendre de psi=1 sur la ligne de boot.
+  cfg --enable PSI
+  cfg --disable PSI_DEFAULT_DISABLED
+  cfg --enable MEMCG                  # pression par tranche cgroup, idem oomd
+
+  # THP en madvise et pas en always: en "always", la compaction provoque des
+  # à-coups de plusieurs dizaines de millisecondes, exactement le défaut de
+  # fluidité qu'on cherche à supprimer. Les moteurs de jeu et les JVM qui
+  # veulent des hugepages les demandent explicitement.
+  cfg --enable TRANSPARENT_HUGEPAGE
+  cfg --enable TRANSPARENT_HUGEPAGE_MADVISE
+  cfg --disable TRANSPARENT_HUGEPAGE_ALWAYS
+  cfg --enable COMPACTION
+  cfg --enable KSM
+  cfg --enable HUGETLBFS
+  cfg --enable MEMORY_FAILURE
+  cfg --enable USERFAULTFD            # CRIU, Wine, gestionnaires mémoire
+
+  # --- Fluidité: entrées/sorties --------------------------------------------
+  # BFQ est l'ordonnanceur qui privilégie les tâches interactives: c'est lui
+  # qui évite qu'une mise à jour APT fasse bégayer une vidéo. Il est disponible
+  # ici; le choix par device revient à une règle udev côté image AuxiNuxOS.
+  cfg --enable MQ_IOSCHED_DEADLINE
+  cfg --enable MQ_IOSCHED_KYBER
+  cfg --enable IOSCHED_BFQ
+  cfg --enable BFQ_GROUP_IOSCHED
+  cfg --enable BLK_WBT
+  cfg --enable BLK_WBT_MQ
+  cfg --enable BLK_CGROUP_IOCOST
+  cfg --enable IO_URING
+
+  # --- CPU: fréquence et états de repos -------------------------------------
+  # X86_NATIVE_CPU compile en -march=native, donc pour le CPU de la MACHINE DE
+  # BUILD. Le noyau publié tomberait en #UD sur toute machine plus ancienne.
+  # Garde explicite: un noyau de distribution ne peut pas être "natif".
+  cfg --disable X86_NATIVE_CPU
+  cfg --enable MICROCODE
+  # Le chargement de microcode à chaud est une source connue de corruption:
+  # on charge par l'initramfs au démarrage, pas sur un système en marche.
+  cfg --disable MICROCODE_LATE_LOADING
+  # Aucun pilote cpufreq ne couvre seul le parc visé: sans acpi-cpufreq, tout
+  # AMD antérieur à Zen 2 reste bloqué à fréquence fixe, ce qui se ressent
+  # autant en bureautique (lenteur) qu'en jeu (fréquence plafonnée).
+  cfg --enable CPU_FREQ
+  cfg --enable X86_ACPI_CPUFREQ
+  cfg --module X86_POWERNOW_K8
+  cfg --enable X86_INTEL_PSTATE
+  cfg --enable X86_AMD_PSTATE
+  cfg --set-val X86_AMD_PSTATE_DEFAULT_MODE 3   # actif (EPP), défaut amont
+  cfg --enable CPU_FREQ_GOV_SCHEDUTIL
+  cfg --enable CPU_FREQ_DEFAULT_GOV_SCHEDUTIL
+  cfg --enable CPU_FREQ_GOV_PERFORMANCE
+  cfg --enable CPU_FREQ_GOV_POWERSAVE
+  cfg --enable CPU_FREQ_GOV_ONDEMAND
+  cfg --enable CPU_FREQ_GOV_CONSERVATIVE
+  cfg --enable CPU_IDLE
+  cfg --enable CPU_IDLE_GOV_MENU
+  cfg --enable CPU_IDLE_GOV_TEO
+  cfg --enable INTEL_IDLE
+  cfg --enable X86_X2APIC
+
+  # ==========================================================================
+  # Rollback AuxiNuxOS — prérequis noyau
+  # ==========================================================================
+  # Le rollback d'AuxiNuxOS repose sur une racine BTRFS en sous-volumes plats
+  # (@, @home, @snapshots...), snapper, grub-btrfs, et un hook initramfs
+  # (auxinux-snapshot-overlay) qui superpose un tmpfs inscriptible sur un
+  # instantané en LECTURE SEULE pour pouvoir démarrer dessus. Trois exigences
+  # en découlent, et deux n'étaient pas satisfaites jusqu'ici.
+  #
+  # 1. BTRFS en BUILT-IN, pas en module. La racine doit pouvoir être montée
+  #    même quand l'initramfs est cassé ou périmé — c'est-à-dire précisément
+  #    dans la situation où l'on veut restaurer. Un BTRFS en module fait
+  #    dépendre le recours de l'objet qu'on soupçonne d'être en panne.
+  cfg --enable BTRFS_FS
+  cfg --enable BTRFS_FS_POSIX_ACL
+  # Debug BTRFS coupé: gain réel et mesurable sur le chemin d'écriture.
+  cfg --disable BTRFS_DEBUG
+  cfg --disable BTRFS_ASSERT
+  cfg --disable BTRFS_FS_RUN_SANITY_TESTS
+  # compress=zstd:1 est dans les options de montage de la racine AuxiNuxOS:
+  # sans zstd built-in, cette racine ne se monte pas.
+  cfg --enable ZSTD_COMPRESS
+  cfg --enable ZSTD_DECOMPRESS
+  # Sommes de contrôle BTRFS (crc32c par défaut). Les variantes accélérées x86
+  # ne sont plus des symboles distincts en 7.x: elles sont tirées par la
+  # bibliothèque crypto dès que l'algorithme générique est activé.
+  cfg --enable CRYPTO_CRC32C
+  cfg --enable CRYPTO_XXHASH
+  cfg --enable CRYPTO_BLAKE2B
+  cfg --enable CRYPTO_SHA256
+  #
+  # 2. OverlayFS et tmpfs avec XATTR, en built-in. Le hook initramfs monte un
+  #    overlay dont l'upperdir est un tmpfs; OverlayFS REFUSE de se monter si
+  #    le système de fichiers supérieur ne gère pas les attributs étendus.
+  #    Sans TMPFS_XATTR, le démarrage sur instantané échoue — c'est-à-dire que
+  #    le rollback ne marche que lorsqu'on n'en a pas besoin.
+  cfg --enable OVERLAY_FS
+  cfg --enable TMPFS
+  cfg --enable TMPFS_XATTR
+  cfg --enable TMPFS_POSIX_ACL
+  cfg --enable BLK_DEV_INITRD
+  cfg --enable RD_ZSTD
+  cfg --enable RD_GZIP
+  cfg --enable RD_LZ4
+  #
+  # 3. Chaîne EFI complète: grub-btrfs régénère des entrées de menu, et
+  #    efibootmgr/GRUB ont besoin des variables EFI pour le faire.
+  cfg --enable EFI
+  cfg --enable EFI_STUB
+  cfg --enable EFIVAR_FS
+  cfg --enable EFI_VARS_PSTORE
+  cfg --enable ACPI
+  cfg --enable ACPI_TABLE_UPGRADE
+
+  # --- Systèmes de fichiers d'un poste de travail ---------------------------
+  cfg --enable EXT4_FS
+  cfg --enable EXT4_FS_POSIX_ACL
+  cfg --enable EXT4_FS_SECURITY
+  cfg --module XFS_FS
+  cfg --module F2FS_FS
+  # Partition EFI: built-in, avec ses tables de caractères, sinon /boot/efi ne
+  # se monte pas sans initramfs.
+  cfg --enable VFAT_FS
+  cfg --enable NLS_CODEPAGE_437
+  cfg --enable NLS_ISO8859_1
+  cfg --enable NLS_UTF8
+  cfg --module EXFAT_FS               # cartes SD, clés USB modernes
+  # NTFS3: lecture/écriture des partitions Windows. AuxiNuxOS livre une couche
+  # windows-support; un double amorçage doit pouvoir lire son autre disque.
+  cfg --module NTFS3_FS
+  cfg --enable NTFS3_LZX_XPRESS
+  cfg --enable NTFS3_FS_POSIX_ACL
+  cfg --module ISO9660_FS
+  cfg --enable JOLIET
+  cfg --enable ZISOFS
+  cfg --module UDF_FS
+  cfg --module SQUASHFS
+  cfg --enable SQUASHFS_XZ
+  cfg --enable SQUASHFS_ZSTD
+  # FUSE: Flatpak (revokefs), AppImage, fuse-overlayfs, gvfs. Sur une image où
+  # "les applications Flatpak sont privilégiées", ce n'est pas optionnel.
+  cfg --enable FUSE_FS
+  cfg --module CUSE
+  cfg --enable BLK_DEV_LOOP
+  cfg --module NFS_FS
+  cfg --module CIFS
+  cfg --module AUTOFS_FS
+  # Chiffrement de disque (LUKS) et instantanés LVM pour les installations qui
+  # ne sont pas en BTRFS.
+  cfg --enable BLK_DEV_DM
+  cfg --module DM_CRYPT
+  cfg --module DM_SNAPSHOT
+  cfg --enable CRYPTO_XTS
+  cfg --enable CRYPTO_AES_NI_INTEL
+  cfg --enable CRYPTO_USER_API_SKCIPHER
+  # Stockage: AHCI et NVMe built-in, la racine monte sans initramfs.
+  cfg --enable ATA
+  cfg --enable SATA_AHCI
+  cfg --enable ATA_PIIX
+  cfg --enable BLK_DEV_NVME
+  cfg --module USB_STORAGE
+  cfg --module USB_UAS
+  cfg --module MMC
+  cfg --module MMC_BLOCK
+  cfg --module MMC_SDHCI
+  cfg --module MMC_SDHCI_PCI
+  cfg --module MMC_SDHCI_ACPI
+  cfg --module MISC_RTSX_PCI          # lecteurs de cartes Realtek (portables)
+
+  # ==========================================================================
+  # Virtualisation conservée: LXC, Docker et KVM
+  # ==========================================================================
+  # --- Conteneurs: cgroups v2, espaces de noms -----------------------------
+  cfg --enable CGROUPS
+  cfg --enable CGROUP_BPF
+  cfg --enable CGROUP_FREEZER
+  cfg --enable CGROUP_PIDS
+  cfg --enable CGROUP_DEVICE
+  cfg --enable CGROUP_SCHED
+  cfg --enable CGROUP_MISC
+  cfg --enable CGROUP_CPUACCT
+  cfg --enable CGROUP_PERF
+  cfg --enable CGROUP_HUGETLB
+  cfg --enable FAIR_GROUP_SCHED
+  cfg --enable CFS_BANDWIDTH
+  cfg --enable BLK_CGROUP
+  cfg --enable BLK_DEV_THROTTLING
+  cfg --enable CPUSETS
+  cfg --enable NAMESPACES
+  # USER_NS est aussi le prérequis de bubblewrap, donc de TOUT Flatpak non
+  # privilégié: le couper pour "durcir" casserait le mode de distribution
+  # d'applications par défaut d'AuxiNuxOS.
+  cfg --enable USER_NS
+  cfg --enable NET_NS
+  cfg --enable PID_NS
+  cfg --enable IPC_NS
+  cfg --enable UTS_NS
+  cfg --enable TIME_NS
+  cfg --enable SECCOMP
+  cfg --enable CHECKPOINT_RESTORE
+  cfg --enable POSIX_MQUEUE
+  cfg --enable KEYS
+  cfg --enable DEVTMPFS
+  cfg --enable DEVTMPFS_MOUNT
+
+  # --- Réseau des conteneurs (NAT Docker, bridges LXC) ----------------------
+  cfg --enable VETH
+  cfg --enable TUN
+  cfg --enable BRIDGE
+  cfg --enable BRIDGE_VLAN_FILTERING
+  cfg --enable BRIDGE_NETFILTER
+  cfg --enable MACVLAN
+  cfg --enable IPVLAN
+  cfg --enable VLAN_8021Q
+  cfg --module DUMMY
+  cfg --module WIREGUARD
+  cfg --enable NETFILTER
+  cfg --enable NF_TABLES
+  cfg --enable NF_CONNTRACK
+  cfg --enable NF_NAT
+  cfg --enable NFT_NAT
+  cfg --enable NFT_MASQ
+  cfg --enable NFT_REJECT
+  cfg --enable NETFILTER_XT_MATCH_ADDRTYPE
+  cfg --enable NETFILTER_XT_MATCH_CONNTRACK
+  # Les cibles IP_NF_* historiques sont encore émises par docker et lxc-net;
+  # depuis 7.x elles dépendent explicitement de NETFILTER_XTABLES_LEGACY.
+  cfg --enable NETFILTER_XTABLES
+  cfg --enable NETFILTER_XTABLES_LEGACY
+  cfg --enable IP_NF_IPTABLES
+  cfg --enable IP_NF_FILTER
+  cfg --enable IP_NF_NAT
+  cfg --enable IP_NF_TARGET_MASQUERADE
+  cfg --enable IP6_NF_IPTABLES
+  cfg --enable NET_SCHED
+  cfg --enable NET_CLS_CGROUP
+  cfg --module NET_CLS_BPF
+  cfg --module NET_ACT_BPF
+  cfg --module NET_SCH_FQ_CODEL
+  cfg --module NET_SCH_CAKE           # anti-bufferbloat: latence en jeu en ligne
+  cfg --module NET_SCH_FQ             # ordonnanceur attendu par BBR
+  cfg --module TCP_CONG_BBR
+
+  # --- KVM: machines virtuelles depuis le bureau (Boxes, virt-manager) ------
+  cfg --enable VIRTUALIZATION
+  cfg --enable KVM
+  cfg --module KVM_INTEL
+  cfg --module KVM_AMD
+  cfg --module VHOST_NET
+  cfg --module VHOST_VSOCK
+  cfg --module VSOCKETS
+  cfg --module VIRTIO_VSOCKETS
+  cfg --enable PARAVIRT
+  cfg --enable PARAVIRT_SPINLOCKS
+  cfg --enable HYPERVISOR_GUEST
+  # AuxiNuxOS s'installe et se valide aussi EN machine virtuelle: les pilotes
+  # invités VirtIO de démarrage sont built-in pour ne pas dépendre d'un
+  # initramfs correct dans ce cas non plus.
+  cfg --enable VIRTIO_PCI
+  cfg --enable VIRTIO_BLK
+  cfg --enable VIRTIO_NET
+  cfg --module VIRTIO_CONSOLE
+  cfg --module VIRTIO_BALLOON
+  cfg --module VIRTIO_INPUT
+  cfg --module VIRTIO_FS
+  # IOMMU: passthrough occasionnel (eGPU, carte son USB dédiée, VM GPU).
+  # INTEL_IOMMU_DEFAULT_ON reste volontairement à l'écart: l'activer par défaut
+  # casse le démarrage de certaines cartes anciennes. Opt-in documenté:
+  # intel_iommu=on iommu=pt
+  cfg --enable IOMMU_SUPPORT
+  cfg --enable INTEL_IOMMU
+  cfg --enable AMD_IOMMU
+  cfg --enable IRQ_REMAP
+  cfg --module VFIO
+  cfg --module VFIO_PCI
+
+  # ==========================================================================
+  # Portable: alimentation, thermique, touches constructeur
+  # ==========================================================================
+  # Contrairement au profil hyperviseur, qui coupe SUSPEND et HIBERNATION pour
+  # éliminer une classe entière de bugs ACPI, un poste de travail DOIT pouvoir
+  # se mettre en veille: rabattre l'écran est le geste le plus courant qui
+  # soit.
+  cfg --enable SUSPEND
+  cfg --enable HIBERNATION
+  cfg --module ACPI_AC
+  cfg --module ACPI_BATTERY
+  cfg --module ACPI_BUTTON
+  cfg --module ACPI_FAN
+  cfg --module ACPI_THERMAL
+  cfg --enable ACPI_DOCK
+  cfg --enable ACPI_PROCESSOR
+  cfg --module ACPI_WMI
+  cfg --enable X86_PLATFORM_DEVICES
+  cfg --module THINKPAD_ACPI
+  cfg --module ASUS_WMI
+  cfg --module ASUS_NB_WMI
+  cfg --module DELL_LAPTOP
+  cfg --module DELL_WMI
+  cfg --module DELL_SMBIOS
+  cfg --module HP_WMI
+  cfg --module ACER_WMI
+  cfg --module MSI_WMI
+  cfg --module LENOVO_YMC
+  cfg --module INTEL_HID_EVENT
+  cfg --module INTEL_VBTN
+  cfg --module INTEL_PMC_CORE
+  cfg --module AMD_PMC
+  cfg --module AMD_PMF                # gestion thermique/plateforme AMD récente
+  cfg --enable THERMAL
+  cfg --module X86_PKG_TEMP_THERMAL
+  cfg --module INT340X_THERMAL
+  cfg --enable HWMON
+  cfg --module SENSORS_CORETEMP
+  cfg --module SENSORS_K10TEMP
+  cfg --module SENSORS_NCT6775
+  cfg --module SENSORS_DELL_SMM
+  cfg --enable PCIEASPM
+  cfg --enable PCIEASPM_DEFAULT       # économie d'énergie PCIe par défaut
+
+  # --- Bus et périphériques -------------------------------------------------
+  cfg --enable USB_SUPPORT
+  cfg --enable USB
+  cfg --enable USB_XHCI_HCD
+  cfg --module USB_EHCI_HCD
+  cfg --module USB_OHCI_HCD
+  cfg --module USB_UHCI_HCD
+  cfg --module USB_PRINTER
+  cfg --module USB_ACM
+  cfg --module USB_SERIAL
+  cfg --module USB_USBNET
+  cfg --module USB_NET_CDCETHER
+  cfg --module USB_RTL8152            # adaptateurs Ethernet USB et stations d'accueil
+  cfg --module USB4                   # Thunderbolt 3/4 et USB4
+  cfg --module USB4_NET
+  cfg --enable HOTPLUG_PCI
+  cfg --enable HOTPLUG_PCI_PCIE
+  cfg --module R8169
+  cfg --module E1000
+  cfg --module E1000E
+  cfg --module IGB
+  cfg --module IGC
+  cfg --module ALX
+  cfg --module ATL1C
+
+  # --- Wi-Fi et Bluetooth ---------------------------------------------------
+  # Corrections de noms révélées par le garde-fou au passage en 7.2:
+  #   MT76        n'existe pas (bibliothèque interne MT76_CORE, auto-sélectionnée)
+  #   ATH12K_PCI  n'existe plus: ATH12K est directement le pilote PCI
+  # Les deux étaient des no-op silencieux sur le profil AuxiNuxOS.
   cfg --enable RFKILL
   cfg --enable WLAN
-
-  # Principales familles Wi-Fi Intel, Qualcomm, MediaTek, Realtek et Broadcom.
+  cfg --module CFG80211
+  cfg --enable CFG80211_WEXT
+  cfg --module MAC80211
   cfg --module IWLWIFI
-  cfg --module IWLMVM
+  cfg --module IWLDVM                 # Intel 5000/6000 (2009-2012)
+  cfg --module IWLMVM                 # Intel 7260 -> AX211
+  cfg --module IWLMLD                 # Intel Wi-Fi 7 (BE200/BE201)
+  cfg --module ATH9K
   cfg --module ATH10K
   cfg --module ATH10K_PCI
   cfg --module ATH11K
   cfg --module ATH11K_PCI
   cfg --module ATH12K
-  cfg --module ATH12K_PCI
-  cfg --module MT76
-  cfg --module MT76_USB
-  cfg --module MT76_CONNAC_LIB
+  cfg --module MT7601U
+  cfg --module MT7915E
+  cfg --module MT7921E                # Wi-Fi 6E, très répandu depuis 2022
+  cfg --module MT7925E                # Wi-Fi 7
   cfg --module RTW88
-  cfg --module RTW88_PCI
-  cfg --module RTW88_USB
   cfg --module RTW89
-  cfg --module RTW89_PCI
   cfg --module BRCMFMAC
-  cfg --module BRCMFMAC_PCIE
-  cfg --module BRCMFMAC_USB
+  cfg --enable BRCMFMAC_PCIE
+  cfg --enable BRCMFMAC_USB
   cfg --module MWIFIEX
   cfg --module MWIFIEX_PCIE
   cfg --module MWIFIEX_USB
   cfg --module RTL8XXXU
-
+  cfg --module BT
   cfg --module BT_HCIBTUSB
   cfg --module BT_HCIUART
-  cfg --enable INPUT_UINPUT
-  cfg --enable INPUT_JOYDEV
-  cfg --module HID_MULTITOUCH
-fi
+  cfg --module BT_RFCOMM
+  cfg --module BT_BNEP
+  cfg --module BT_HIDP                # claviers, souris et manettes Bluetooth
+  cfg --enable BT_LE
 
+  # ==========================================================================
+  # Sécurité
+  # ==========================================================================
+  # SECURITY_APPARMOR=y ne suffit PAS: si 'apparmor' n'est pas dans CONFIG_LSM,
+  # les profils AppArmor de Docker, LXC et snap ne s'appliquent JAMAIS — en
+  # silence, sans aucune erreur visible. On reprend la chaîne exacte de
+  # Debian 13.
+  cfg --enable SECURITY
+  cfg --enable SECURITY_APPARMOR
+  cfg --enable SECURITY_LANDLOCK      # utilisé par systemd 257 et Flatpak
+  cfg --enable SECURITY_YAMA
+  cfg --enable SECURITY_SELINUX
+  cfg --set-str LSM "landlock,lockdown,yama,integrity,apparmor,bpf"
+  cfg --enable BPF_SYSCALL
+  cfg --enable BPF_JIT
+  cfg --enable BPF_JIT_ALWAYS_ON
+  cfg --enable BPF_UNPRIV_DEFAULT_OFF
+  cfg --enable RANDOMIZE_BASE
+  cfg --enable STACKPROTECTOR_STRONG
+  # Mitigations spéculatives: compilées ET actives par défaut. Sur un poste
+  # personnel qui exécute du code tiers (navigateur, jeux, Flatpak), les
+  # couper est un choix d'exploitation que l'utilisateur peut faire au boot
+  # avec mitigations=off — pas un choix de build qu'on impose à tout le parc.
+  cfg --enable CPU_MITIGATIONS
+  cfg --enable MITIGATION_PAGE_TABLE_ISOLATION
+  cfg --enable MITIGATION_RETPOLINE
+  cfg --enable MITIGATION_SPECTRE_V1
+  cfg --enable MITIGATION_SPECTRE_V2
+  cfg --enable MITIGATION_RETHUNK
+  cfg --enable MITIGATION_SRSO
+  cfg --enable MITIGATION_MDS
+  cfg --enable MITIGATION_L1TF
+  cfg --enable MITIGATION_VMSCAPE
+
+  # --- Prérequis systemd (fichier REQUIREMENTS amont) -----------------------
+  # Jusqu'ici hérités par chance de la config Debian, jamais vérifiés.
+  cfg --enable FHANDLE
+  cfg --enable DMIID
+  cfg --enable INOTIFY_USER
+  cfg --enable SIGNALFD
+  cfg --enable TIMERFD
+  cfg --enable EPOLL
+  cfg --enable SYSVIPC
+  cfg --enable UNIX98_PTYS
+  cfg --enable CRYPTO_USER_API_HASH
+  cfg --enable KCMP
+  cfg --enable PROC_FS
+  cfg --enable SYSFS
+  cfg --enable BINFMT_ELF
+  cfg --module BINFMT_MISC            # exécution des .exe via la couche Windows
+  # Binaires 32 bits: Steam, Wine/Proton, quelques installeurs propriétaires.
+  # IA32_EMULATION seul ne suffit plus depuis 6.7: si
+  # IA32_EMULATION_DEFAULT_DISABLED est activé, le support est compilé mais
+  # inerte tant qu'on ne passe pas ia32_emulation=1 au boot — un Steam qui
+  # refuse de démarrer sans le moindre message utile.
+  cfg --enable IA32_EMULATION
+  cfg --disable IA32_EMULATION_DEFAULT_DISABLED
+
+  # --- Diagnostic et dernier recours ----------------------------------------
+  # Alt+SysRq+REISUB permet de redémarrer proprement une session graphique
+  # figée au lieu de couper l'alimentation — et une coupure brutale sur BTRFS
+  # est exactement ce qu'on veut éviter quand on mise sur les instantanés.
+  cfg --enable MAGIC_SYSRQ
+  cfg --enable SOFTLOCKUP_DETECTOR
+  cfg --enable DETECT_HUNG_TASK
+  # BOOTPARAM_*_PANIC sont des ENTIERS (nombre de détections avant panic), pas
+  # des booléens: --disable y serait un no-op. 0 = tracer et continuer.
+  cfg --set-val BOOTPARAM_SOFTLOCKUP_PANIC 0
+  cfg --set-val BOOTPARAM_HUNG_TASK_PANIC 0
+  cfg --enable X86_MCE
+  cfg --enable X86_MCE_INTEL
+  cfg --enable X86_MCE_AMD
+  cfg --enable RAS
+  cfg --enable PSTORE
+  cfg --enable TASK_DELAY_ACCT
+  cfg --enable TASKSTATS
+  cfg --enable TASK_IO_ACCOUNTING
+  cfg --enable PERF_EVENTS
+
+  # --- Firmware -------------------------------------------------------------
+  # EXTRA_FIRMWARE reste VIDE: le firmware vient des paquets Debian
+  # non-free-firmware (amdgpu, i915, iwlwifi...) via /lib/firmware, pas
+  # embarqué dans vmlinuz. L'embarquer figerait des versions et gonflerait
+  # l'image pour rien.
+  cfg --set-str EXTRA_FIRMWARE ""
+  cfg --enable FW_LOADER
+  cfg --disable FW_LOADER_USER_HELPER
+  cfg --enable FW_LOADER_COMPRESS
+  cfg --enable FW_LOADER_COMPRESS_ZSTD
 fi
 
 # Résout les dépendances et fige la config
@@ -1345,6 +2104,75 @@ make "${MAKE_ARCH_ARGS[@]}" olddefconfig
 # ============================================================
 echo
 echo "[6/9] Vérification de la config finale..."
+
+# ============================================================
+# [6a] Vérification des options RÉELLEMENT demandées
+# ============================================================
+# Sans ce contrôle, un cfg() sur un symbole renommé ou supprimé upstream est un
+# no-op silencieux: scripts/config écrit la ligne, olddefconfig la retire, et
+# rien ne le signale.
+#
+# Deux verdicts distincts:
+#   INCONNU  -> le symbole n'existe pas dans CE noyau (renommé/supprimé).
+#               Erreur bloquante: l'intention exprimée n'a rien produit.
+#   IGNORÉ   -> le symbole existe mais olddefconfig ne l'a pas retenu, presque
+#               toujours parce qu'une dépendance manque. Avertissement détaillé.
+echo "Indexation des symboles Kconfig de ${KERNEL_VERSION}..."
+KCONFIG_SYMBOLS="${BUILD_ROOT}/kconfig-symbols-${KERNEL_VERSION}.txt"
+find . -type f -name 'Kconfig*' -print0 \
+  | xargs -0 grep -hoE '^[[:space:]]*(menu)?config[[:space:]]+[A-Za-z0-9_]+' \
+  | awk '{print $NF}' | sort -u > "$KCONFIG_SYMBOLS"
+echo "  $(wc -l < "$KCONFIG_SYMBOLS") symboles connus, ${#CFG_REQUESTS[@]} options demandées."
+
+cfg_unknown=()
+cfg_ignored=()
+for req in "${CFG_REQUESTS[@]}"; do
+  IFS=$'\t' read -r _sym _action _expect <<<"$req"
+
+  if ! grep -qxF "$_sym" "$KCONFIG_SYMBOLS"; then
+    cfg_unknown+=("${_sym} (${_action})")
+    continue
+  fi
+
+  case "$_expect" in
+    y|m)
+      grep -q "^CONFIG_${_sym}=${_expect}\$" .config \
+        || cfg_ignored+=("${_sym}: demandé=${_expect} obtenu=$(cfg_actual "$_sym")")
+      ;;
+    n)
+      grep -q "^CONFIG_${_sym}=[ym]\$" .config \
+        && cfg_ignored+=("${_sym}: demandé=n obtenu=$(cfg_actual "$_sym")")
+      ;;
+    str:*)
+      _want="${_expect#str:}"
+      grep -q "^CONFIG_${_sym}=\"${_want}\"\$" .config \
+        || cfg_ignored+=("${_sym}: demandé=\"${_want}\" obtenu=$(cfg_actual "$_sym")")
+      ;;
+    val:*)
+      _want="${_expect#val:}"
+      grep -q "^CONFIG_${_sym}=${_want}\$" .config \
+        || cfg_ignored+=("${_sym}: demandé=${_want} obtenu=$(cfg_actual "$_sym")")
+      ;;
+  esac
+done
+
+if (( ${#cfg_ignored[@]} > 0 )); then
+  echo
+  echo "AVERTISSEMENT: ${#cfg_ignored[@]} option(s) demandée(s) non retenue(s) par olddefconfig"
+  echo "  (symbole existant mais dépendance manquante, ou valeur forcée):"
+  printf '  - %s\n' "${cfg_ignored[@]}"
+fi
+
+if (( ${#cfg_unknown[@]} > 0 )); then
+  echo
+  echo "Symboles INCONNUS dans Linux ${KERNEL_VERSION}:"
+  printf '  - %s\n' "${cfg_unknown[@]}"
+  die "${#cfg_unknown[@]} symbole(s) Kconfig inexistant(s) dans ce noyau.
+Ils ont été renommés ou supprimés upstream: le cfg() correspondant n'a RIEN fait.
+Corrige les noms dans la section de configuration avant de compiler."
+fi
+
+echo "Toutes les options demandées existent dans Linux ${KERNEL_VERSION}."
 
 opt_on() { grep -q "^CONFIG_${1}=[ym]" .config; }
 
@@ -1379,17 +2207,69 @@ elif [[ "$PROFILE" == "desktop" ]]; then
     BTRFS_FS XFS_FS OVERLAY_FS SECCOMP
   )
 else
+  # Sans ces options, le paquet produit n'est pas un noyau AuxiNuxOS utilisable.
   CRITICAL=(
-    DRM DRM_KMS_HELPER INPUT_EVDEV HID USB_SUPPORT
-    SOUND SND RFKILL WLAN CFG80211 MAC80211 BT EXT4_FS
+    # Affichage et entrées: sans eux la machine démarre mais reste noire.
+    DRM DRM_SIMPLEDRM VT FRAMEBUFFER_CONSOLE
+    INPUT_EVDEV HID HID_GENERIC USB_HID USB_SUPPORT
+    # Audio et radio.
+    SOUND SND RFKILL WLAN CFG80211 MAC80211 BT
+    # Racines supportées.
+    EXT4_FS BTRFS_FS
+    # Rollback: overlay inscriptible sur instantané en lecture seule.
+    OVERLAY_FS TMPFS_XATTR
+    # Fluidité: PSI est le prérequis dur de systemd-oomd.
+    PSI MEMCG ZRAM LRU_GEN
+    # Conteneurs LXC/Docker.
+    CGROUPS CGROUP_SCHED BLK_CGROUP NAMESPACES USER_NS NET_NS PID_NS
+    SECCOMP VETH BRIDGE TUN SECURITY_APPARMOR
+    # Modules hors-arbre (NVIDIA propriétaire, VirtualBox, ZFS) via DKMS.
+    MODVERSIONS
+    # eBPF CO-RE.
+    BPF_SYSCALL DEBUG_INFO_BTF
+    # Prérequis systemd non négociables.
+    FHANDLE INOTIFY_USER SIGNALFD TIMERFD EPOLL
+    # Flatpak / AppImage.
+    FUSE_FS
+    # Plateforme CPU.
+    MICROCODE CPU_FREQ
+  )
+
+  # Options qui DOIVENT être compilées en dur, pas en module: monter la racine
+  # ou démarrer sur un instantané ne doit dépendre d'aucun initramfs.
+  # opt_on() accepte 'm', ce qui masquerait précisément la régression que cette
+  # liste existe pour attraper.
+  CRITICAL_BUILTIN=(
+    BTRFS_FS ZSTD_COMPRESS ZSTD_DECOMPRESS
+    OVERLAY_FS TMPFS_XATTR
+    EXT4_FS VFAT_FS
+    ATA SATA_AHCI BLK_DEV_NVME
+    DRM DRM_SIMPLEDRM SYSFB_SIMPLEFB FRAMEBUFFER_CONSOLE
+    EFIVAR_FS
   )
 
   RECOMMENDED=(
-    DRM_I915 DRM_XE DRM_AMDGPU DRM_NOUVEAU DRM_RADEON
-    DRM_SIMPLEDRM DRM_FBDEV_EMULATION FRAMEBUFFER_CONSOLE
-    SND_HDA_INTEL BT_HCIBTUSB
-    IWLWIFI ATH10K ATH11K ATH12K MT76 RTW88 RTW89 BRCMFMAC
-    BTRFS_FS XFS_FS OVERLAY_FS SECCOMP
+    # GPU: les trois constructeurs.
+    DRM_I915 DRM_XE DRM_AMDGPU DRM_AMD_DC DRM_NOUVEAU DRM_RADEON
+    DRM_FBDEV_EMULATION BACKLIGHT_CLASS_DEVICE
+    # Audio moderne (SOF) et amplificateurs de portables.
+    SND_HDA_INTEL SND_HDA_CODEC_REALTEK SND_HDA_CODEC_HDMI SND_USB_AUDIO
+    SND_SOC_SOF_INTEL_TOPLEVEL
+    # Jeu.
+    NTSYNC JOYSTICK_XPAD HID_PLAYSTATION HID_NINTENDO HID_STEAM INPUT_JOYDEV
+    IA32_EMULATION
+    # Fluidité.
+    PREEMPT_DYNAMIC SCHED_AUTOGROUP UCLAMP_TASK IOSCHED_BFQ BLK_WBT
+    ZRAM_WRITEBACK LRU_GEN_ENABLED X86_INTEL_PSTATE X86_AMD_PSTATE
+    # Conteneurs et virtualisation.
+    KVM KVM_INTEL KVM_AMD NF_TABLES NF_NAT IP_NF_TARGET_MASQUERADE
+    CGROUP_HUGETLB CFS_BANDWIDTH CHECKPOINT_RESTORE SECURITY_LANDLOCK
+    # Périphériques.
+    BT_HCIBTUSB IWLWIFI IWLMVM IWLMLD ATH10K ATH11K ATH12K
+    MT7921E MT7925E RTW88 RTW89 BRCMFMAC
+    USB4 MMC_SDHCI EXFAT_FS NTFS3_FS XFS_FS
+    # Portable.
+    SUSPEND HIBERNATION THINKPAD_ACPI THERMAL HWMON
   )
 fi
 
@@ -1402,6 +2282,18 @@ missing_reco=()
 for o in "${RECOMMENDED[@]}"; do
   opt_on "$o" || missing_reco+=("$o")
 done
+
+# Un pilote de racine en module passerait opt_on() sans que la racine soit
+# montable sans initramfs: on contrôle la valeur exacte.
+opt_builtin() { grep -q "^CONFIG_${1}=y\$" .config; }
+not_builtin=()
+for o in ${CRITICAL_BUILTIN[@]+"${CRITICAL_BUILTIN[@]}"}; do
+  opt_builtin "$o" || not_builtin+=("${o}=$(cfg_actual "$o")")
+done
+(( ${#not_builtin[@]} == 0 )) || \
+  die "options attendues en BUILT-IN mais qui ne le sont pas: ${not_builtin[*]}
+Elles conditionnent le montage de la racine et le démarrage sur un instantané
+de restauration, qui ne doivent dépendre d'aucun initramfs. Build interrompu."
 
 (( ${#missing_reco[@]} == 0 )) || \
   echo "AVERTISSEMENT: options recommandées absentes: ${missing_reco[*]}"
@@ -1421,6 +2313,16 @@ Sans ça le build produit un paquet -dbg de ~1.7 Go et dure bien plus longtemps.
 fi
 
 echo "Config OK — toutes les options critiques sont présentes."
+
+if [[ "$CONFIG_ONLY" == "1" ]]; then
+  cp .config "${BUILD_ROOT}/config-${KERNEL_VERSION}${LOCAL_VERSION}"
+  echo
+  echo "============================================================"
+  echo " Build à blanc (CONFIG_ONLY=1): arrêt avant compilation."
+  echo " Config retenue: ${BUILD_ROOT}/config-${KERNEL_VERSION}${LOCAL_VERSION}"
+  echo "============================================================"
+  exit 0
+fi
 
 # ============================================================
 # [7/9] Compilation
@@ -1564,6 +2466,17 @@ for pkg in "${debs[@]}"; do
   pkg_name="$(dpkg-deb -f "$pkg" Package)"
   pkg_arch="$(dpkg-deb -f "$pkg" Architecture)"
   pkg_version="$(dpkg-deb -f "$pkg" Version)"
+
+  # Les paquets -dbg/-dbgsym pèsent 1 à 2 Go et ne servent qu'au débogage du
+  # noyau. DEBUG_INFO_BTF impose du DWARF complet, donc ils existent désormais
+  # à chaque build: le meta ne les référence pas, les publier ne ferait que
+  # saturer le dépôt et la bande passante des postes.
+  case "$pkg_name" in
+    *-dbg|*-dbgsym)
+      echo "SKIP $(basename "$pkg") (symboles de debug, non publiés)"
+      continue
+      ;;
+  esac
 
   if [[ "$pkg_name" == "linux-libc-dev" ]]; then
     echo "SKIP $(basename "$pkg") (linux-libc-dev reste fourni par Debian)"

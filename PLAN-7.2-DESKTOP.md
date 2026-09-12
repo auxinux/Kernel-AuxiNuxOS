@@ -250,9 +250,66 @@ Wi-Fi : correction des trois symboles morts du §0, plus `IWLMLD` (Wi-Fi 7 Intel
 | 4 | Vérification des 516 demandes (499 symboles distincts) contre l'arbre `linux-7.2.5` | index Kconfig | **fait** |
 | 5 | **Build à blanc sur le serveur DEV** | `.config` + rapport `[6a]` | **fait** — 4 défauts trouvés, cf. §10.1 |
 | 6 | Revue du `.config` généré | validation | **fait** — cf. §10.2 |
-| 7 | Build complet | `.deb` dans `OUTPUT_DIR` | en cours |
-| 8 | Tests (§11) | rapport | à faire |
-| 9 | Notes de version | — | à faire |
+| 7 | Build complet | `.deb` dans `OUTPUT_DIR` | **fait** — 2 h 40, cf. §10.3 |
+| 8 | Publication dépôt + purge 7.1.x | suite APT `kernel` | **fait** — cf. §10.4 |
+| 9 | Tests sur matériel réel (§11) | rapport | **à faire — le noyau n'a jamais démarré** |
+| 10 | Notes de version | — | à faire |
+
+### 10.3 Build et taille du paquet
+
+Le paquet image est passé de **89 Mo** (7.1.12) à **165 Mo**. Trois causes,
+mesurées et non supposées :
+
+| Cause | Effet |
+|---|---|
+| **BTF dans les modules** (`DEBUG_INFO_BTF_MODULES`) — le 7.1.12 était en `DEBUG_INFO_NONE`, sans aucun BTF | **47 %** des octets de modules |
+| Pilotes ajoutés (xe, amdgpu SI/CIK, SOF…) + passage 6.12 → 7.2 | +16 % par module |
+| Compression des modules | cf. ci-dessous |
+
+**Compression : zstd → xz.** Le noyau compresse les modules avec `zstd` sans
+niveau, donc au **niveau 3** par défaut (`scripts/Makefile.modinst`). Mesuré sur
+300 modules du build : 13,2 Mo en zstd contre 9,4 Mo en xz, soit **29 % de
+plus**. Debian 13 livre ses modules en xz (`linux-image-6.12.101+deb13`, arbre
+de 104 Mo, `DEBUG_INFO_BTF_MODULES=y` lui aussi). Le profil a donc été aligné
+sur Debian : le paquet est passé de 214 Mo à **165 Mo**.
+
+`MODULE_COMPRESS_*` est un **`choice`**, comme `PREEMPT` : activer XZ ne
+désélectionne pas ZSTD. Sans désélection explicite, le changement aurait été un
+no-op silencieux — exactement le piège du §10.1.
+
+Le repackage n'a recompilé **qu'un seul objet** (`kernel/module/decompress.o`,
+qui passe de `ZSTD_DECOMPRESS` à `XZ_DEC`), mais le relink de `vmlinux` a obligé
+à régénérer le BTF des 4042 modules (BTF « split », relatif à `vmlinux`).
+
+Contrôles sur le paquet final : `vmlinuz` 16,7 Mo avec BTF, 4042 modules tous
+en `.ko.xz`, modules **strippés du DWARF** mais porteurs de `.BTF`,
+`linux-image-*-dbg` (1,8 Go) et `linux-libc-dev` exclus de la publication.
+
+### 10.4 Publication — 12 septembre 2026
+
+```
+KERNEL/      kernel-auxinuxos 7.2.5-auxinuxos-amd64.1  (+ image, headers)
+KERNEL-DEV/  vide
+```
+
+Purge effectuée : 7.1.3 et 7.1.12 retirés de `KERNEL/` (y compris leurs paquets
+`-dbg` de 1,7 Go), 7.2.2-dev retiré de `KERNEL-DEV/`. La rétention automatique
+ne l'aurait **pas** fait : `KEEP_VERSIONS=2` groupe par *(préfixe, suffixe)* de
+nom de paquet et aurait gardé 7.1.12 à côté de 7.2.5.
+
+Sauvegarde préalable : `~/kernel-purge-backup-auxinuxos-20260912-004720`
+(5,2 Go, `KERNEL/` + `KERNEL-DEV/` + `dists/`) sur l'hôte du dépôt.
+
+Vérifications après publication :
+
+| Contrôle | Résultat |
+|---|---|
+| Index APT `kernel` | 3 paquets, tous en 7.2.5, `Depends` du meta correct |
+| Index APT `kernel-dev` | 0 paquet |
+| HTTP des 3 paquets | 200 |
+| HTTP des anciens 7.1.x et 7.2.2-dev | 404 |
+| sha256 servi vs construit | **identique** (image et headers) |
+| Signature `InRelease` des deux suites | `Good signature from "AuxiNux Repository <repo@auxinux.ca>"` |
 
 ### 10.1 Ce que le build à blanc a attrapé
 

@@ -1137,6 +1137,10 @@ cfg --disable LOCALVERSION_AUTO
 
 # --- Pas de clés de signature hors infra Debian ---
 cfg --set-str SYSTEM_TRUSTED_KEYS ""
+# SYSTEM_REVOCATION_KEYS dépend de SYSTEM_REVOCATION_LIST, que la base Debian
+# laisse à n: le symbole n'est alors pas émis du tout et [6a] le signale comme
+# "obtenu=non défini". C'est le résultat voulu (aucune clé de révocation), pas
+# une anomalie — on garde la demande au cas où la base changerait.
 cfg --set-str SYSTEM_REVOCATION_KEYS ""
 
 # --- Infos de debug et BTF --------------------------------------------------
@@ -1564,6 +1568,14 @@ elif [[ "$PROFILE" == "auxinuxos" ]]; then
   # débit sur une compilation.
   # PREEMPT_DYNAMIC garde la porte ouverte: `preempt=lazy` au boot rend le débit
   # sans rebuild, pour une machine qui compile plus qu'elle ne joue.
+  # PREEMPT appartient à un `choice`: écrire CONFIG_PREEMPT=y ne suffit pas,
+  # olddefconfig garde le membre déjà sélectionné par la config Debian de base
+  # (PREEMPT_LAZY) et annule silencieusement la demande. Il faut désélectionner
+  # les autres membres d'abord. Constaté au build à blanc 7.2.5:
+  # "PREEMPT: demandé=y obtenu=n".
+  cfg --disable PREEMPT_NONE
+  cfg --disable PREEMPT_VOLUNTARY
+  cfg --disable PREEMPT_LAZY
   cfg --enable PREEMPT
   cfg --enable PREEMPT_DYNAMIC
   # 1000 Hz: "the preferred choice for desktop systems" (kernel/Kconfig.hz).
@@ -1850,9 +1862,14 @@ elif [[ "$PROFILE" == "auxinuxos" ]]; then
   cfg --enable NETFILTER_XTABLES
   cfg --enable NETFILTER_XTABLES_LEGACY
   cfg --enable IP_NF_IPTABLES
-  cfg --enable IP_NF_FILTER
-  cfg --enable IP_NF_NAT
-  cfg --enable IP_NF_TARGET_MASQUERADE
+  # En 7.x, IP_NF_FILTER/NAT/TARGET_MASQUERADE dépendent de
+  # IP_NF_IPTABLES_LEGACY, un tristate que Debian livre en module: ils ne
+  # PEUVENT donc pas être built-in. C'est sans conséquence, docker et lxc-net
+  # les chargent à la demande. Demander =y ne produisait qu'un avertissement.
+  cfg --module IP_NF_IPTABLES_LEGACY
+  cfg --module IP_NF_FILTER
+  cfg --module IP_NF_NAT
+  cfg --module IP_NF_TARGET_MASQUERADE
   cfg --enable IP6_NF_IPTABLES
   cfg --enable NET_SCHED
   cfg --enable NET_CLS_CGROUP
@@ -2092,7 +2109,11 @@ elif [[ "$PROFILE" == "auxinuxos" ]]; then
   # l'image pour rien.
   cfg --set-str EXTRA_FIRMWARE ""
   cfg --enable FW_LOADER
-  cfg --disable FW_LOADER_USER_HELPER
+  # FW_LOADER_USER_HELPER est sélectionné par plusieurs pilotes: le forcer à n
+  # est impossible. Ce n'est pas lui qui pose problème mais FW_LOADER_USER_HELPER_FALLBACK,
+  # qui fait attendre 60 s à chaque firmware absent. Debian le laisse à n;
+  # on le vérifie au lieu de se battre avec le premier.
+  cfg --disable FW_LOADER_USER_HELPER_FALLBACK
   cfg --enable FW_LOADER_COMPRESS
   cfg --enable FW_LOADER_COMPRESS_ZSTD
 fi
@@ -2305,8 +2326,11 @@ Vérifie le .config et les dépendances. Build interrompu."
 
 # cfg() ignore les erreurs: sans ce controle, une option devenue non
 # selectionnable retombe silencieusement sur la valeur de la config de base.
-if [[ "$WITH_DEBUG_INFO" == "1" ]]; then
-  opt_on DEBUG_INFO_BTF || echo "AVERTISSEMENT: WITH_DEBUG_INFO=1 mais CONFIG_DEBUG_INFO_BTF absent (eBPF CO-RE indisponible)."
+# Le profil auxinuxos active BTF d'office (défaut Debian 13), et BTF IMPOSE du
+# DWARF complet: CONFIG_DEBUG_INFO=y y est donc attendu, pas une régression.
+# Le paquet -dbg produit au passage n'est pas publié ([8/9]).
+if [[ "$PROFILE" == "auxinuxos" || "$WITH_DEBUG_INFO" == "1" ]]; then
+  opt_on DEBUG_INFO_BTF || echo "AVERTISSEMENT: CONFIG_DEBUG_INFO_BTF absent (eBPF CO-RE indisponible)."
 elif grep -q '^CONFIG_DEBUG_INFO=y' .config; then
   die "CONFIG_DEBUG_INFO=y alors que WITH_DEBUG_INFO=0.
 La désactivation n'a pas pris: vérifie CONFIG_DEBUG_INFO_NONE dans .config.

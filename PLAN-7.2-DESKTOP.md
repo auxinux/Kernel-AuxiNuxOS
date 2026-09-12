@@ -248,11 +248,50 @@ Wi-Fi : correction des trois symboles morts du §0, plus `IWLMLD` (Wi-Fi 7 Intel
 | 2 | Profil `auxinuxos` réécrit en branche autonome (~450 options) | `build-kernel-core.sh` | **fait** |
 | 3 | Wrapper épinglé sur la série 7.2 + détection EOL | `build-AuxiNuxOS-kernel.sh` | **fait** |
 | 4 | Vérification des 516 demandes (499 symboles distincts) contre l'arbre `linux-7.2.5` | index Kconfig | **fait** |
-| 5 | **Build à blanc sur le serveur de build** | `.config` + rapport `[6a]` | à faire |
-| 6 | Revue du `.config` généré, diff contre la 7.1.x publiée | validation | à faire |
-| 7 | Build complet | `.deb` dans `OUTPUT_DIR` | à faire |
+| 5 | **Build à blanc sur le serveur DEV** | `.config` + rapport `[6a]` | **fait** — 4 défauts trouvés, cf. §10.1 |
+| 6 | Revue du `.config` généré | validation | **fait** — cf. §10.2 |
+| 7 | Build complet | `.deb` dans `OUTPUT_DIR` | en cours |
 | 8 | Tests (§11) | rapport | à faire |
-| 9 | Notes de version, publication dépôt | suite APT `kernel` | à faire |
+| 9 | Notes de version | — | à faire |
+
+### 10.1 Ce que le build à blanc a attrapé
+
+Quatre défauts qu'une vérification de symboles seule ne pouvait pas voir, parce
+qu'ils dépendent de la résolution des dépendances à partir de la config Debian :
+
+| Constat `[6a]` | Cause | Correctif |
+|---|---|---|
+| `PREEMPT: demandé=y obtenu=n` | `PREEMPT` appartient à un **`choice`**. Écrire `CONFIG_PREEMPT=y` ne suffit pas : `olddefconfig` garde le membre déjà sélectionné par la base Debian (`PREEMPT_LAZY`) et annule la demande **en silence**. | désélectionner `PREEMPT_NONE`/`PREEMPT_VOLUNTARY`/`PREEMPT_LAZY` d'abord |
+| `IP_NF_FILTER/NAT/TARGET_MASQUERADE: demandé=y obtenu=m` | en 7.x ils dépendent de `IP_NF_IPTABLES_LEGACY`, tristate livré en module par Debian : ils **ne peuvent pas** être built-in | passer en `--module` (sans conséquence : `docker` et `lxc-net` les chargent à la demande) |
+| `FW_LOADER_USER_HELPER: demandé=n obtenu=y` | sélectionné par plusieurs pilotes, impossible à forcer à `n` | viser `FW_LOADER_USER_HELPER_FALLBACK` — c'est lui qui fait attendre 60 s à chaque firmware absent |
+| Build interrompu sur `CONFIG_DEBUG_INFO=y` | le garde de `[6/9]` datait d'avant l'activation du BTF, qui **impose** du DWARF complet | le garde tient compte du profil |
+
+Le premier est le plus instructif : sans le build à blanc, tout le travail sur
+la latence (§3.4) tombait à l'eau **sans un seul message**, et le noyau aurait
+été publié en `PREEMPT_LAZY` alors que la note de version aurait annoncé une
+préemption complète.
+
+Reste **un** avertissement, bénin et documenté : `SYSTEM_REVOCATION_KEYS`
+n'est pas émis tant que `SYSTEM_REVOCATION_LIST` est à `n` — c'est le résultat
+voulu (aucune clé de révocation).
+
+### 10.2 `.config` retenu — contrôles
+
+```
+CONFIG_PREEMPT=y            CONFIG_HZ=1000           CONFIG_SCHED_AUTOGROUP=y
+CONFIG_BTRFS_FS=y           CONFIG_TMPFS_XATTR=y     CONFIG_ZSTD_COMPRESS=y
+CONFIG_PSI=y                (PSI_DEFAULT_DISABLED absent)
+CONFIG_MEMCG=y              CONFIG_ZRAM=m            CONFIG_ZRAM_DEF_COMP_ZSTD=y
+CONFIG_LRU_GEN_ENABLED=y    CONFIG_NTSYNC=m          CONFIG_IA32_EMULATION=y
+CONFIG_DRM=y                CONFIG_DRM_SIMPLEDRM=y   CONFIG_SYSFB_SIMPLEFB=y
+CONFIG_DRM_AMD_DC=y         CONFIG_DRM_AMDGPU=m      CONFIG_DRM_I915=m
+CONFIG_VFAT_FS=y            CONFIG_SATA_AHCI=y       CONFIG_BLK_DEV_NVME=y
+CONFIG_EFIVAR_FS=y          CONFIG_MODVERSIONS=y     (TRIM_UNUSED_KSYMS absent)
+CONFIG_LSM="landlock,lockdown,yama,integrity,apparmor,bpf"
+```
+
+`477 options demandées`, 21 721 symboles Kconfig indexés, toutes les options
+`CRITICAL` présentes et toutes les `CRITICAL_BUILTIN` réellement en `=y`.
 
 ```bash
 # 5. build à blanc — À FAIRE EN PREMIER sur le serveur de build

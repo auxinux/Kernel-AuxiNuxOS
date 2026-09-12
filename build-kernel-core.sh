@@ -919,6 +919,7 @@ ZFS_DEPS=(
   autoconf automake libtool gawk
   uuid-dev libblkid-dev libudev-dev
   zlib1g-dev libaio-dev libattr1-dev libffi-dev
+  libtirpc-dev                        # XDR/RPC requis par native-deb-utils
   python3-dev python3-setuptools
   debhelper dh-python po-debconf      # packaging .deb natif (pas d'alien/rpm)
 )
@@ -2397,7 +2398,7 @@ Ou passe outre (DÉCONSEILLÉ): ALLOW_UNVERIFIED_SOURCE=1"
   # flag, OpenZFS configure aussi le build du module noyau (--with-config=all
   # par defaut), ce qui exige des headers noyau sur ce serveur et ouvre la porte
   # a ce qu'un objet noyau se retrouve empaquete — l'inverse de l'objectif.
-  ./configure --prefix=/usr --with-config=user
+  ./configure --prefix=/usr --with-config=user --with-tirpc
 
   echo "Construction du paquetage Debian natif OpenZFS (PAS d'alien/rpm)..."
   # native-deb-utils = cible Makefile.am d'OpenZFS lançant dpkg-buildpackage

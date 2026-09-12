@@ -1175,7 +1175,33 @@ fi
 # --- Compression: kernel et modules ----------------------------------------
 cfg --enable KERNEL_ZSTD
 cfg --enable MODULE_COMPRESS
-cfg --enable MODULE_COMPRESS_ZSTD
+
+# Compression des modules: xz sur le profil poste de travail, zstd ailleurs.
+#
+# Le noyau compresse les modules avec `zstd` SANS niveau, donc au niveau 3 par
+# défaut (scripts/Makefile.modinst). Mesuré sur 300 modules du build 7.2.5:
+# 13,2 Mo en zstd contre 9,4 Mo en xz, soit 29 % de plus. Sur l'arbre complet
+# c'est ~60 Mo de téléchargement en plus à chaque mise à jour noyau, sur chaque
+# poste — pour un gain de décompression de quelques dizaines de millisecondes
+# au démarrage, réparties sur les quelques centaines de modules réellement
+# chargés.
+#
+# Debian 13 livre ses modules en xz (vérifié sur linux-image-6.12.101+deb13:
+# arbre de 104 Mo). Un noyau AuxiNuxOS « optimisé pour Debian 13 » suit ce
+# réglage. Le profil hyperviseur garde zstd: il a beaucoup moins de modules et
+# le compromis ne se pose pas dans les mêmes termes.
+# MODULE_COMPRESS_* est un `choice`, comme PREEMPT: activer un membre ne
+# désélectionne PAS l'autre, et olddefconfig garde alors celui déjà en place.
+# Il faut désélectionner explicitement.
+if [[ "$PROFILE" == "auxinuxos" ]]; then
+  cfg --disable MODULE_COMPRESS_GZIP
+  cfg --disable MODULE_COMPRESS_ZSTD
+  cfg --enable MODULE_COMPRESS_XZ
+else
+  cfg --disable MODULE_COMPRESS_GZIP
+  cfg --disable MODULE_COMPRESS_XZ
+  cfg --enable MODULE_COMPRESS_ZSTD
+fi
 
 # --- Modules hors-arbre (DKMS): gardes OBLIGATOIRES -------------------------
 # Sur une station AuxiNuxOS, les modules DKMS ne sont pas une hypothèse: le

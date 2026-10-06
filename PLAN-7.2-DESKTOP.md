@@ -311,6 +311,28 @@ Vérifications après publication :
 | sha256 servi vs construit | **identique** (image et headers) |
 | Signature `InRelease` des deux suites | `Good signature from "AuxiNux Repository <repo@auxinux.ca>"` |
 
+### 10.5 Canal dev : 7.2.9 — 6 octobre 2026
+
+Rebuild sur la dernière stable de la série, **sans aucune modification du
+profil** : le wrapper suit `--branch=7.2` et a sélectionné 7.2.9 de lui-même.
+
+* Build à blanc (`track=dev -config-only`) : 479 options demandées, même et
+  unique avertissement bénin qu'en 7.2.5 (`SYSTEM_REVOCATION_KEYS`).
+* `.config` comparé au 7.2.5 publié : seules différences, `LOCALVERSION`
+  (`-dev-auxinuxos-amd64`) et `MODULE_COMPRESS_XZ` — le 7.2.5 avait été passé
+  en xz par repackage, le 7.2.9 l'est dès la configuration.
+* Build complet : environ 5 h (07 h 55 → 12 h 51), 4043 modules tous en `.ko.xz`.
+
+```
+KERNEL/      kernel-auxinuxos     7.2.5-auxinuxos-amd64.1      (inchangé)
+KERNEL-DEV/  kernel-auxinuxos-dev 7.2.9-dev-auxinuxos-amd64.1  (+ image, headers)
+```
+
+Publié depuis un staging neuf `~/incoming/auxinuxos-dev-7.2.9`. Index APT
+`kernel-dev` à 3 paquets avec `Depends` du meta correct, HTTP 200, sha256 servi
+identique au construit (image et headers), `InRelease` des deux suites signé
+valide. Comme le 7.2.5, ce noyau n'a pas encore démarré sur du matériel réel.
+
 ### 10.1 Ce que le build à blanc a attrapé
 
 Quatre défauts qu'une vérification de symboles seule ne pouvait pas voir, parce

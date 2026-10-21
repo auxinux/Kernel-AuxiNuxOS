@@ -333,6 +333,46 @@ Publié depuis un staging neuf `~/incoming/auxinuxos-dev-7.2.9`. Index APT
 identique au construit (image et headers), `InRelease` des deux suites signé
 valide. Comme le 7.2.5, ce noyau n'a pas encore démarré sur du matériel réel.
 
+### 10.6 Prod 7.2.11 et build dev 7.3 — 21 octobre 2026
+
+Répertoire de build nettoyé au préalable (166 Go : arbres et tarballs 7.1.5 à
+7.2.9, paquets déjà publiés, `-dbg`, `output-ancien-7.1`). Seuls les `config-*`
+et `kconfig-symbols-*` de référence ont été gardés.
+
+* Builds à blanc : 479 options demandées, **toutes présentes** en 7.2.11 comme
+  en 7.3, même avertissement bénin `SYSTEM_REVOCATION_KEYS`.
+* 7.3 n'est pas encore « stable » sur kernel.org (moniker `mainline`) :
+  `--branch=7.3` ne trouve rien, le build dev passe par
+  `KERNEL_VERSION=7.3 track=dev`.
+* Écarts de `.config` 7.2.11 → 7.3, tous d'origine amont : `PROC_SYSCTL`
+  n'existe plus (`proc_sysctl.o` dépend désormais de `SYSCTL`, qui est à `y`),
+  `EFS_FS`, `VXFS_FS`, `IBM_ASM`, `XEN_PVHVM*`, `OPENVSWITCH_GRE/VXLAN/GENEVE`
+  retirés. `PSI`, `TMPFS_XATTR`, `MODULE_COMPRESS_XZ` intacts.
+* Builds complets enchaînés : 7.2.11 fini à 07 h 25, 7.3 à 13 h 38.
+  4045 modules (7.2.11) et 4042 (7.3), tous en `.ko.xz`.
+
+```
+KERNEL/      kernel-auxinuxos 7.2.11-auxinuxos-amd64.1  (+ image, headers)
+             7.2.5 conservé (image, headers) comme noyau de repli
+KERNEL-DEV/  kernel-auxinuxos-dev 7.2.9-dev-auxinuxos-amd64.1  (inchangé)
+```
+
+Publié depuis un staging neuf `~/incoming/auxinuxos-prod-7.2.11`, après
+sauvegarde `~/kernel-backup-auxinuxos-20261021-184251` (`KERNEL/` + `dists/`).
+Index APT `kernel` à 5 paquets, meta en 7.2.11 avec `Depends` correct, HTTP 200
+partout, sha256 servi identique au construit, `InRelease` des deux suites signé
+valide. Le 7.3 est construit sur `virtua-dev` mais **pas publié**.
+
+**Image 7.3 plus légère (115 Mo contre 165 Mo)** : ce n'est pas un manque. Les
+deux noyaux ont `DEBUG_INFO_BTF_MODULES=y`, mais en 7.2.x la section `.BTF` des
+modules est gonflée (24 Ko pour `rc-winfast-usbii-deluxe`, contre 1,1 Ko en
+7.3) : le BTF des modules n'y est apparemment pas dédupliqué contre celui de
+`vmlinux`. 7.2.5 et 7.2.9 avaient déjà la même taille. Sans effet fonctionnel
+connu ; à creuser si la taille de la 7.2 importe.
+
+Les journaux `/tmp/build-*.log` ont été perdus au redémarrage de `virtua-dev`
+(18 h 22) : les prochains builds doivent journaliser hors de `/tmp`.
+
 ### 10.1 Ce que le build à blanc a attrapé
 
 Quatre défauts qu'une vérification de symboles seule ne pouvait pas voir, parce

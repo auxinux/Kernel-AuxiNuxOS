@@ -354,14 +354,22 @@ et `kconfig-symbols-*` de référence ont été gardés.
 ```
 KERNEL/      kernel-auxinuxos 7.2.11-auxinuxos-amd64.1  (+ image, headers)
              7.2.5 conservé (image, headers) comme noyau de repli
-KERNEL-DEV/  kernel-auxinuxos-dev 7.2.9-dev-auxinuxos-amd64.1  (inchangé)
+KERNEL-DEV/  kernel-auxinuxos-dev 7.3-dev-auxinuxos-amd64.1  (+ image, headers)
+             7.2.9-dev conservé (image, headers) comme noyau de repli
 ```
 
 Publié depuis un staging neuf `~/incoming/auxinuxos-prod-7.2.11`, après
 sauvegarde `~/kernel-backup-auxinuxos-20261021-184251` (`KERNEL/` + `dists/`).
 Index APT `kernel` à 5 paquets, meta en 7.2.11 avec `Depends` correct, HTTP 200
 partout, sha256 servi identique au construit, `InRelease` des deux suites signé
-valide. Le 7.3 est construit sur `virtua-dev` mais **pas publié**.
+valide.
+
+Le 7.3 a suivi, publié depuis un staging neuf `~/incoming/auxinuxos-dev-7.3`
+(`RELEASE_TRACK=dev`) après sauvegarde
+`~/kernel-backup-auxinuxos-dev-20261021-193744`. Index APT `kernel-dev` à
+5 paquets, meta en 7.3 avec `Depends` correct, HTTP 200, sha256 servi identique
+au construit, `InRelease` des deux suites signé valide. Ni le 7.2.11 ni le 7.3
+n'ont encore démarré sur du matériel réel.
 
 **Image 7.3 plus légère (115 Mo contre 165 Mo)** : ce n'est pas un manque. Les
 deux noyaux ont `DEBUG_INFO_BTF_MODULES=y`, mais en 7.2.x la section `.BTF` des

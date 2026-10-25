@@ -24,7 +24,9 @@ AuxiNuxOS Kernel Builder
 Builds the dedicated AuxiNuxOS COSMIC/Wayland DESKTOP kernel: office,
 multimedia and gaming on one machine, with LXC/Docker and KVM kept intact,
 ZRAM, Intel/AMD/NVIDIA GPU support, and the built-ins required by the
-AuxiNuxOS BTRFS rollback.
+AuxiNuxOS BTRFS rollback. On arm64 the same profile adds SoC GPUs (Mali,
+Adreno, VideoCore), Energy Aware Scheduling and 4K pages for FEX/Box64, on top
+of the GPG-verified Debian arm64 config.
 
 Default: latest non-RC release of the 7.2 series, amd64.
 
@@ -56,7 +58,9 @@ Aliases:
 
 Architecture and build options are forwarded to the local kernel build engine:
   -arch=amd64         Native x86_64 build (default).
-  -arch=arm64         ARM64/aarch64 cross-build.
+  -arch=arm64         ARM64/aarch64 cross-build. Base config: Debian arm64
+                      from trixie-backports, GPG-verified (override with
+                      BASE_CONFIG_ARM64=/path).
   KERNEL_VERSION=X.Y.Z[-rcN]
                       Explicit version; bypasses series/channel detection.
   -config-only        Dry run: apply and VERIFY the kernel configuration, then

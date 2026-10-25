@@ -651,6 +651,12 @@ cfg_actual() {
   fi
 }
 
+# Les blocs de configuration séparent ce qui n'existe que sur x86 (microcode,
+# pilotes WMI, Intel/AMD pstate...) de son équivalent ARM64. Sans ce tri, un
+# symbole x86 demandé sur arm64 existe bien dans l'arbre — [6a] ne le signale
+# donc pas comme INCONNU — mais ne peut jamais être sélectionné.
+is_x86() { [[ "$KBUILD_DEBARCH" == "amd64" ]]; }
+
 is_supported_debian13_base() {
   case "${ID:-}" in
     debian|virtuaos|auxinux|auxinuxos|auxinux-virtua|virtua) ;;
@@ -1067,11 +1073,121 @@ pick_base_config() {
   return 1
 }
 
+# Config Debian arm64, pour un build croisé depuis un hôte amd64.
+#
+# /boot ne contient que des configs amd64 sur le serveur de build. L'ancien
+# repli `make defconfig` donnait un noyau de développement ARM: pilotes en dur
+# au hasard des cartes d'évaluation, pas de BTF, pas de LSM Debian, aucune des
+# centaines de modules qu'attend un poste de travail. On prend à la place la
+# config du noyau Debian arm64 — exactement ce que fait le chemin amd64 avec
+# /boot/config-*-amd64 — puis le profil applique ses options par-dessus.
+#
+# Chaîne de confiance complète: InRelease vérifié par gpgv contre
+# debian-archive-keyring, Packages.xz contrôlé par le SHA256 d'InRelease, puis
+# le .deb par le SHA256 de Packages. Une config de base falsifiée serait une
+# porte dérobée dans un noyau publié.
+#
+# Préférence: même série que KERNEL_VERSION (trixie-backports suit les séries
+# récentes), sinon la plus récente disponible. Résultat dans DEBIAN_BASE_CONFIG.
+fetch_debian_arm64_config() {
+  local mirror="${DEBIAN_MIRROR:-http://deb.debian.org/debian}"
+  local keyring="/usr/share/keyrings/debian-archive-keyring.gpg"
+  local cache="${BUILD_ROOT}/debian-base-config/arm64"
+  local suite idx sha size pick pkg_sha pkg_file pkg_name member
+
+  DEBIAN_BASE_CONFIG=""
+  mkdir -p "$cache"
+  [[ -r "$keyring" ]] || sudo apt install -y debian-archive-keyring
+  [[ -r "$keyring" ]] || { echo "ERREUR: $keyring introuvable." >&2; return 1; }
+
+  local packages=()
+  for suite in trixie-backports trixie; do
+    if ! wget -q -O "${cache}/InRelease-${suite}" "${mirror}/dists/${suite}/InRelease"; then
+      echo "  ${suite}: InRelease indisponible, suite ignorée." >&2
+      continue
+    fi
+    gpgv --keyring "$keyring" --output "${cache}/Release-${suite}" \
+      "${cache}/InRelease-${suite}" 2>/dev/null \
+      || { echo "ERREUR: signature InRelease invalide pour ${suite}." >&2; return 1; }
+
+    idx="main/binary-arm64/Packages.xz"
+    read -r sha size < <(awk -v F="$idx" '
+      /^SHA256:/ {s=1; next} /^[^ ]/ {s=0}
+      s && $3 == F {print $1, $2; exit}' "${cache}/Release-${suite}")
+    [[ -n "${sha:-}" ]] || { echo "ERREUR: ${idx} absent de Release ${suite}." >&2; return 1; }
+    wget -q -O "${cache}/Packages-${suite}.xz" "${mirror}/dists/${suite}/${idx}" \
+      || { echo "ERREUR: téléchargement ${suite}/${idx}." >&2; return 1; }
+    echo "${sha}  ${cache}/Packages-${suite}.xz" | sha256sum -c --quiet - \
+      || { echo "ERREUR: SHA256 de ${suite}/${idx} incorrect." >&2; return 1; }
+    xz -dc "${cache}/Packages-${suite}.xz" > "${cache}/Packages-${suite}"
+    packages+=("${cache}/Packages-${suite}")
+    sha=""
+  done
+  (( ${#packages[@]} > 0 )) || { echo "ERREUR: aucun index Debian arm64 lisible." >&2; return 1; }
+
+  # Le paquet qui porte la config dépend de la disposition Debian:
+  #   7.x : linux-base-X+debN-arm64            -> usr/lib/modules/X/config
+  #   6.x : linux-image-X+debN-arm64-unsigned  -> boot/config-X
+  # Seule la saveur générique "arm64" est retenue (pas cloud, rt ni 16k).
+  pick="$(python3 - "${KERNEL_VERSION}" "${packages[@]}" <<'PY'
+import re, sys
+want = ".".join(sys.argv[1].split("-")[0].split(".")[:2])
+pat = re.compile(r"^linux-(?:base|image)-(\d+)\.(\d+)\.(\d+)\+deb\d+-arm64(?:-unsigned)?$")
+cands = []
+for path in sys.argv[2:]:
+    for stanza in open(path, encoding="utf-8").read().split("\n\n"):
+        f = dict(l.split(": ", 1) for l in stanza.splitlines() if ": " in l and not l.startswith(" "))
+        name = f.get("Package", "")
+        m = pat.match(name)
+        if not m or "Filename" not in f or "SHA256" not in f:
+            continue
+        # linux-image-*-arm64 sans -unsigned n'est plus qu'un méta en 7.x.
+        if name.startswith("linux-image-") and not name.endswith("-unsigned"):
+            continue
+        ver = tuple(int(x) for x in m.groups())
+        cands.append((f"{ver[0]}.{ver[1]}" == want, ver, f["SHA256"], f["Filename"], name))
+if not cands:
+    raise SystemExit("aucun paquet de config Debian arm64 trouvé")
+best = max(cands)
+print(best[2], best[3], best[4])
+PY
+)" || { echo "ERREUR: sélection du paquet Debian arm64 impossible." >&2; return 1; }
+  read -r pkg_sha pkg_file pkg_name <<<"$pick"
+  echo "  Config de base Debian arm64: ${pkg_name}" >&2
+
+  local deb="${cache}/$(basename "$pkg_file")"
+  if ! { [[ -f "$deb" ]] && echo "${pkg_sha}  ${deb}" | sha256sum -c --quiet - 2>/dev/null; }; then
+    wget -q -O "$deb" "${mirror}/${pkg_file}" \
+      || { echo "ERREUR: téléchargement de ${pkg_file}." >&2; return 1; }
+    echo "${pkg_sha}  ${deb}" | sha256sum -c --quiet - \
+      || { echo "ERREUR: SHA256 de ${pkg_file} incorrect." >&2; return 1; }
+  fi
+
+  member="$(dpkg-deb --fsys-tarfile "$deb" | tar -t \
+    | grep -E '^\./(boot/config-[^/]+|usr/lib/modules/[^/]+/config)$' | head -n1 || true)"
+  [[ -n "$member" ]] || { echo "ERREUR: aucune config dans ${pkg_name}." >&2; return 1; }
+  dpkg-deb --fsys-tarfile "$deb" | tar -xO "$member" > "${cache}/config-${pkg_name}"
+  grep -q '^CONFIG_ARM64=y$' "${cache}/config-${pkg_name}" \
+    || { echo "ERREUR: ${member} n'est pas une config arm64." >&2; return 1; }
+  DEBIAN_BASE_CONFIG="${cache}/config-${pkg_name}"
+}
+
 BASE_CONFIG="$(pick_base_config || true)"
 
-if [[ "$KBUILD_DEBARCH" != "amd64" ]]; then
-  echo "Architecture cible non-amd64 (${KBUILD_DEBARCH}); utilisation de make defconfig."
-  make "${MAKE_ARCH_ARGS[@]}" defconfig
+if [[ "$KBUILD_DEBARCH" == "arm64" ]]; then
+  # BASE_CONFIG_ARM64=/chemin force une config précise (build hors ligne).
+  if [[ -n "${BASE_CONFIG_ARM64:-}" ]]; then
+    [[ -f "$BASE_CONFIG_ARM64" ]] || die "BASE_CONFIG_ARM64 introuvable: ${BASE_CONFIG_ARM64}"
+    BASE_CONFIG="$BASE_CONFIG_ARM64"
+  else
+    fetch_debian_arm64_config \
+      || die "impossible d'obtenir la config Debian arm64 de référence.
+Un repli sur 'make defconfig' produirait un noyau sans rapport avec Debian:
+fournis BASE_CONFIG_ARM64=/chemin/vers/config si le miroir est injoignable."
+    BASE_CONFIG="$DEBIAN_BASE_CONFIG"
+  fi
+  cp "$BASE_CONFIG" .config
+  echo "Config de base: $BASE_CONFIG"
 elif [[ -n "${BASE_CONFIG}" ]]; then
   cp "$BASE_CONFIG" .config
   echo "Config de base: $BASE_CONFIG"
@@ -1173,7 +1289,16 @@ else
 fi
 
 # --- Compression: kernel et modules ----------------------------------------
-cfg --enable KERNEL_ZSTD
+# arm64 n'offre pas le choix KERNEL_* (pas de HAVE_KERNEL_ZSTD): son vmlinuz
+# est l'Image compressée en gzip, décompressée par GRUB ou U-Boot. Seul
+# EFI_ZBOOT y donnerait une image zstd auto-décompressante, mais U-Boot `booti`
+# — le démarrage des cartes Raspberry Pi et Rockchip hors UEFI — ne sait pas la
+# charger. On garde donc le format Debian arm64.
+if is_x86; then
+  cfg --enable KERNEL_ZSTD
+else
+  cfg --disable EFI_ZBOOT
+fi
 cfg --enable MODULE_COMPRESS
 
 # Compression des modules: xz sur le profil poste de travail, zstd ailleurs.
@@ -1451,7 +1576,9 @@ elif [[ "$PROFILE" == "auxinuxos" ]]; then
   # En MODULES, obligatoirement: ces pilotes réclament du firmware dans
   # /lib/firmware à l'initialisation, qu'un pilote built-in ne peut pas
   # attendre. C'est aussi ce que fait Debian.
-  cfg --module DRM_I915
+  # i915 est x86 seulement (iGPU). xe se compile aussi sur arm64: une carte
+  # Arc / Battlemage dans une station Ampere fonctionne.
+  is_x86 && cfg --module DRM_I915
   cfg --module DRM_XE
 
   # --- GPU AMD --------------------------------------------------------------
@@ -1486,6 +1613,32 @@ elif [[ "$PROFILE" == "auxinuxos" ]]; then
   cfg --module DRM_QXL
   cfg --module DRM_BOCHS
 
+  # --- GPU des SoC ARM64 ----------------------------------------------------
+  # Sur arm64, le GPU n'est presque jamais une carte PCIe: il est intégré au
+  # SoC et chaque famille a son pilote DRM. Tous ont un pilote Mesa libre
+  # (Panfrost/PanVK, Freedreno/Turnip, V3D/V3DV, Lima, Etnaviv), donc OpenGL
+  # et Vulkan sous COSMIC sans pilote propriétaire. amdgpu, radeon, nouveau
+  # et xe restent ci-dessus pour les stations PCIe (Ampere Altra, CIX P1).
+  if ! is_x86; then
+    cfg --module DRM_PANTHOR          # Mali Valhall CSF: RK3588 (Orange Pi 5, Rock 5)
+    cfg --module DRM_PANFROST         # Mali Midgard/Bifrost: RK3399, Amlogic, MediaTek
+    cfg --module DRM_LIMA             # Mali Utgard: Allwinner A64/H6
+    cfg --module DRM_MSM              # Adreno: Snapdragon X Elite/Plus
+    cfg --module DRM_V3D              # Raspberry Pi 4/5: rendu 3D
+    cfg --module DRM_VC4              # Raspberry Pi 4/5: affichage HDMI
+    cfg --module DRM_ROCKCHIP         # affichage VOP2 + HDMI des SoC Rockchip
+    cfg --module DRM_SUN4I            # affichage Allwinner
+    cfg --module DRM_MESON            # affichage Amlogic
+    cfg --module DRM_TEGRA            # NVIDIA Jetson
+    cfg --module DRM_ETNAVIV          # Vivante: NXP i.MX8
+    # Décodage vidéo matériel V4L2 stateless: sur ces SoC, il ne passe PAS
+    # par le GPU comme VA-API sur x86, mais par un bloc dédié. Sans eux, une
+    # vidéo 4K est décodée au CPU et la machine chauffe pour rien.
+    cfg --module VIDEO_HANTRO         # H.264/VP8/VP9: Rockchip, i.MX8, Allwinner
+    cfg --module VIDEO_ROCKCHIP_VDEC  # H.264/HEVC/VP9 Rockchip
+    cfg --module VIDEO_QCOM_VENUS     # Snapdragon
+  fi
+
   # --- Entrées: clavier, souris, pavé tactile, tablette ---------------------
   # libinput ne lit QUE evdev: c'est la seule interface d'entrée qui compte
   # sous Wayland. INPUT_UINPUT est requis par les outils de remappage et
@@ -1499,6 +1652,9 @@ elif [[ "$PROFILE" == "auxinuxos" ]]; then
   cfg --module HID_MULTITOUCH
   cfg --module I2C_HID
   cfg --module I2C_HID_ACPI
+  # Clavier et pavé tactile des portables Snapdragon X et du Pinebook Pro:
+  # décrits par le device tree, pas par ACPI.
+  is_x86 || cfg --module I2C_HID_OF
   cfg --module HID_APPLE
   cfg --module HID_WACOM
   cfg --module HID_LOGITECH
@@ -1510,9 +1666,12 @@ elif [[ "$PROFILE" == "auxinuxos" ]]; then
   cfg --module HID_CORSAIR
   # Clavier PS/2: encore présent sur les tours et les portables d'avant 2013,
   # et seul moyen d'atteindre le menu GRUB de restauration sur ces machines.
-  cfg --enable SERIO_I8042
-  cfg --enable KEYBOARD_ATKBD
-  cfg --module MOUSE_PS2
+  # Le contrôleur i8042 n'existe pas sur ARM.
+  if is_x86; then
+    cfg --enable SERIO_I8042
+    cfg --enable KEYBOARD_ATKBD
+    cfg --module MOUSE_PS2
+  fi
 
   # --- Jeu: manettes --------------------------------------------------------
   # INPUT_JOYDEV fournit /dev/input/jsX, encore attendu par une partie du
@@ -1533,6 +1692,7 @@ elif [[ "$PROFILE" == "auxinuxos" ]]; then
   # objets avec des eventfd et des futex: moins d'appels système et surtout
   # plus de plafond de descripteurs de fichiers à relever à la main.
   # C'est l'option "jeu" la plus rentable disponible dans un noyau 7.2.
+  # Sur arm64, Wine tourne sous FEX-Emu ou Box64 et profite du même ntsync.
   cfg --module NTSYNC
 
   # --- Audio ----------------------------------------------------------------
@@ -1562,13 +1722,25 @@ elif [[ "$PROFILE" == "auxinuxos" ]]; then
   # APU AMD récents n'ont plus de codec HDA classique. Sans SOF, ces portables
   # n'ont AUCUNE sortie audio.
   cfg --module SND_SOC
-  cfg --enable SND_SOC_SOF_TOPLEVEL
-  cfg --enable SND_SOC_SOF_INTEL_TOPLEVEL
-  cfg --enable SND_SOC_SOF_HDA_AUDIO_CODEC
-  cfg --module SND_SOC_SOF_AMD_TOPLEVEL
-  cfg --module SND_SOC_INTEL_SOUNDWIRE_SOF_MACH
   cfg --module SOUNDWIRE
-  cfg --module SOUNDWIRE_INTEL
+  if is_x86; then
+    cfg --enable SND_SOC_SOF_TOPLEVEL
+    cfg --enable SND_SOC_SOF_INTEL_TOPLEVEL
+    cfg --enable SND_SOC_SOF_HDA_AUDIO_CODEC
+    cfg --module SND_SOC_SOF_AMD_TOPLEVEL
+    cfg --module SND_SOC_INTEL_SOUNDWIRE_SOF_MACH
+    cfg --module SOUNDWIRE_INTEL
+  else
+    # Sur ARM, l'audio est décrit par le device tree: une carte son "graphe"
+    # générique relie le contrôleur I2S du SoC au codec de la carte.
+    cfg --module SND_SIMPLE_CARD
+    cfg --module SND_AUDIO_GRAPH_CARD2
+    cfg --module SND_SOC_X1E80100     # Snapdragon X: haut-parleurs et micros
+    cfg --module SOUNDWIRE_QCOM
+    cfg --module SND_SOC_ROCKCHIP_I2S_TDM
+    cfg --module SND_SOC_ES8316       # codec des cartes RK3588 courantes
+    cfg --module SND_BCM2835          # sortie jack Raspberry Pi 4
+  fi
 
   # --- Multimédia: webcam ---------------------------------------------------
   # Le décodage vidéo matériel (VA-API) passe par i915/amdgpu/nouveau, pas par
@@ -1585,7 +1757,8 @@ elif [[ "$PROFILE" == "auxinuxos" ]]; then
   # --- Ordonnancement et préemption -----------------------------------------
   # En 7.2, sur x86, le choix du modèle de préemption a changé: x86 sélectionne
   # ARCH_HAS_PREEMPT_LAZY, ce qui rend PREEMPT_VOLUNTARY *indisponible* et fait
-  # de PREEMPT_LAZY le défaut. Le seul autre choix possible est PREEMPT, la
+  # de PREEMPT_LAZY le défaut. arm64 est dans le même cas (config Debian arm64
+  # 7.2.9: PREEMPT_LAZY=y): le raisonnement qui suit vaut pour les deux. Le seul autre choix possible est PREEMPT, la
   # préemption complète — décrite par le Kconfig comme "Low-Latency Desktop".
   #
   # On prend PREEMPT: c'est la latence la plus basse, ce qui se voit exactement
@@ -1619,14 +1792,27 @@ elif [[ "$PROFILE" == "auxinuxos" ]]; then
   # de travail c'est exactement l'inverse.
   cfg --enable SCHED_AUTOGROUP
   cfg --enable SCHED_MC
-  cfg --enable SCHED_MC_PRIO          # Turbo Boost Max 3.0: cœurs favoris
+  is_x86 && cfg --enable SCHED_MC_PRIO  # Turbo Boost Max 3.0: cœurs favoris
   cfg --enable SCHED_SMT
-  cfg --enable SCHED_CLUSTER          # chiplets Zen, cœurs E/P Intel
+  cfg --enable SCHED_CLUSTER          # chiplets Zen, cœurs E/P Intel, clusters ARM
   # uclamp: permet de plancher la fréquence demandée par une tâche. C'est ce
   # qui évite que schedutil laisse un jeu tourner à basse fréquence parce que
   # sa charge CPU paraît modeste.
   cfg --enable UCLAMP_TASK
   cfg --enable UCLAMP_TASK_GROUP
+
+  # Energy Aware Scheduling: LE levier de fluidité propre à ARM. Presque tous
+  # les SoC visés sont hétérogènes (big.LITTLE: 4 Cortex-A76 + 4 A55 sur
+  # RK3588, cœurs Oryon répartis en clusters sur Snapdragon X). Sans modèle
+  # énergétique, l'ordonnanceur traite tous les cœurs comme égaux: une tâche
+  # interactive peut rester coincée sur un petit cœur pendant qu'un gros dort.
+  # EAS s'appuie sur schedutil (défaut plus bas) et sur uclamp ci-dessus.
+  # AMU fournit la fréquence réellement atteinte (invariance de fréquence):
+  # sans elle, la charge d'une tâche est mal estimée dès que le SoC chauffe.
+  if ! is_x86; then
+    cfg --enable ENERGY_MODEL
+    cfg --enable ARM64_AMU_EXTN
+  fi
 
   # --- Fluidité: mémoire ----------------------------------------------------
   # ZRAM — demandé explicitement, et de loin le levier le plus rentable sur
@@ -1669,6 +1855,19 @@ elif [[ "$PROFILE" == "auxinuxos" ]]; then
   cfg --enable TRANSPARENT_HUGEPAGE
   cfg --enable TRANSPARENT_HUGEPAGE_MADVISE
   cfg --disable TRANSPARENT_HUGEPAGE_ALWAYS
+  if ! is_x86; then
+    # Pages de 4 Ko, pas 16 ni 64: FEX-Emu et Box64 (exécution de Steam, Proton
+    # et de tout binaire x86-64), Wine, Chromium/Electron et Widevine supposent
+    # des pages de 4 Ko et cassent ou ralentissent fortement au-delà. C'est
+    # aussi le choix du noyau Debian arm64 générique. Choice: on désélectionne
+    # explicitement les deux autres membres.
+    cfg --disable ARM64_16K_PAGES
+    cfg --disable ARM64_64K_PAGES
+    cfg --enable ARM64_4K_PAGES
+    # CONTPTE regroupe 16 PTE contigus en une seule entrée TLB: l'essentiel du
+    # gain des grandes pages, sans la compaction ni les à-coups de THP=always.
+    cfg --enable ARM64_CONTPTE
+  fi
   cfg --enable COMPACTION
   cfg --enable KSM
   cfg --enable HUGETLBFS
@@ -1689,23 +1888,8 @@ elif [[ "$PROFILE" == "auxinuxos" ]]; then
   cfg --enable IO_URING
 
   # --- CPU: fréquence et états de repos -------------------------------------
-  # X86_NATIVE_CPU compile en -march=native, donc pour le CPU de la MACHINE DE
-  # BUILD. Le noyau publié tomberait en #UD sur toute machine plus ancienne.
-  # Garde explicite: un noyau de distribution ne peut pas être "natif".
-  cfg --disable X86_NATIVE_CPU
-  cfg --enable MICROCODE
-  # Le chargement de microcode à chaud est une source connue de corruption:
-  # on charge par l'initramfs au démarrage, pas sur un système en marche.
-  cfg --disable MICROCODE_LATE_LOADING
-  # Aucun pilote cpufreq ne couvre seul le parc visé: sans acpi-cpufreq, tout
-  # AMD antérieur à Zen 2 reste bloqué à fréquence fixe, ce qui se ressent
-  # autant en bureautique (lenteur) qu'en jeu (fréquence plafonnée).
+  # Gouverneurs et cpuidle communs aux deux architectures.
   cfg --enable CPU_FREQ
-  cfg --enable X86_ACPI_CPUFREQ
-  cfg --module X86_POWERNOW_K8
-  cfg --enable X86_INTEL_PSTATE
-  cfg --enable X86_AMD_PSTATE
-  cfg --set-val X86_AMD_PSTATE_DEFAULT_MODE 3   # actif (EPP), défaut amont
   cfg --enable CPU_FREQ_GOV_SCHEDUTIL
   cfg --enable CPU_FREQ_DEFAULT_GOV_SCHEDUTIL
   cfg --enable CPU_FREQ_GOV_PERFORMANCE
@@ -1715,8 +1899,37 @@ elif [[ "$PROFILE" == "auxinuxos" ]]; then
   cfg --enable CPU_IDLE
   cfg --enable CPU_IDLE_GOV_MENU
   cfg --enable CPU_IDLE_GOV_TEO
-  cfg --enable INTEL_IDLE
-  cfg --enable X86_X2APIC
+  if is_x86; then
+    # X86_NATIVE_CPU compile en -march=native, donc pour le CPU de la MACHINE DE
+    # BUILD. Le noyau publié tomberait en #UD sur toute machine plus ancienne.
+    # Garde explicite: un noyau de distribution ne peut pas être "natif".
+    cfg --disable X86_NATIVE_CPU
+    cfg --enable MICROCODE
+    # Le chargement de microcode à chaud est une source connue de corruption:
+    # on charge par l'initramfs au démarrage, pas sur un système en marche.
+    cfg --disable MICROCODE_LATE_LOADING
+    # Aucun pilote cpufreq ne couvre seul le parc visé: sans acpi-cpufreq, tout
+    # AMD antérieur à Zen 2 reste bloqué à fréquence fixe, ce qui se ressent
+    # autant en bureautique (lenteur) qu'en jeu (fréquence plafonnée).
+    cfg --enable X86_ACPI_CPUFREQ
+    cfg --module X86_POWERNOW_K8
+    cfg --enable X86_INTEL_PSTATE
+    cfg --enable X86_AMD_PSTATE
+    cfg --set-val X86_AMD_PSTATE_DEFAULT_MODE 3   # actif (EPP), défaut amont
+    cfg --enable INTEL_IDLE
+    cfg --enable X86_X2APIC
+  else
+    # ARM n'a ni microcode chargeable ni pstate: la fréquence est pilotée par
+    # le firmware ou par une table OPP du device tree, et chaque famille passe
+    # par un pilote différent. Sans le bon, le SoC reste à la fréquence du
+    # chargeur d'amorçage — souvent la plus basse.
+    cfg --module CPUFREQ_DT            # tables OPP DT: Rockchip, Allwinner, Amlogic
+    cfg --module ARM_SCMI_CPUFREQ      # firmware SCMI: RK3588, CIX P1, MediaTek récents
+    cfg --module ACPI_CPPC_CPUFREQ     # UEFI/ACPI: Ampere, CIX P1, VM, Snapdragon X en ACPI
+    cfg --module ARM_QCOM_CPUFREQ_HW   # Snapdragon
+    cfg --module ARM_RASPBERRYPI_CPUFREQ
+    cfg --enable ARM_PSCI_CPUIDLE      # états de repos profonds via le firmware PSCI
+  fi
 
   # ==========================================================================
   # Rollback AuxiNuxOS — prérequis noyau
@@ -1811,21 +2024,42 @@ elif [[ "$PROFILE" == "auxinuxos" ]]; then
   cfg --module DM_CRYPT
   cfg --module DM_SNAPSHOT
   cfg --enable CRYPTO_XTS
-  cfg --enable CRYPTO_AES_NI_INTEL
+  # AES matériel: AES-NI sur x86, extensions Crypto ARMv8 (instructions AESE/
+  # AESD) sur arm64. Sans elles, LUKS chiffre au CPU et un SSD NVMe plafonne
+  # à une fraction de son débit.
+  if is_x86; then
+    cfg --enable CRYPTO_AES_NI_INTEL
+  else
+    cfg --enable CRYPTO_AES_ARM64_CE_BLK
+  fi
   cfg --enable CRYPTO_USER_API_SKCIPHER
   # Stockage: AHCI et NVMe built-in, la racine monte sans initramfs.
   cfg --enable ATA
   cfg --enable SATA_AHCI
-  cfg --enable ATA_PIIX
+  is_x86 && cfg --enable ATA_PIIX
   cfg --enable BLK_DEV_NVME
   cfg --module USB_STORAGE
   cfg --module USB_UAS
-  cfg --module MMC
-  cfg --module MMC_BLOCK
-  cfg --module MMC_SDHCI
-  cfg --module MMC_SDHCI_PCI
-  cfg --module MMC_SDHCI_ACPI
-  cfg --module MISC_RTSX_PCI          # lecteurs de cartes Realtek (portables)
+  if is_x86; then
+    cfg --module MMC
+    cfg --module MMC_BLOCK
+    cfg --module MMC_SDHCI
+    cfg --module MMC_SDHCI_PCI
+    cfg --module MMC_SDHCI_ACPI
+    cfg --module MISC_RTSX_PCI        # lecteurs de cartes Realtek (portables)
+  else
+    # Sur une carte ARM, la carte SD ou l'eMMC EST le disque système: le cœur
+    # MMC reste built-in comme dans la config Debian arm64.
+    cfg --enable MMC
+    cfg --enable MMC_BLOCK
+    # Contrôleur PCIe générique (ECAM): celui des machines virtuelles arm64
+    # (QEMU virt, UTM et Parallels sur Mac Apple Silicon) et des stations
+    # UEFI/ACPI. Built-in, sinon le NVMe ou le virtio-blk qui porte la racine
+    # n'est même pas énuméré sans initramfs.
+    cfg --enable PCI_HOST_GENERIC
+    # AHCI sur bus plateforme (SoC à SATA intégré).
+    cfg --module SATA_AHCI_PLATFORM
+  fi
 
   # ==========================================================================
   # Virtualisation conservée: LXC, Docker et KVM
@@ -1908,16 +2142,22 @@ elif [[ "$PROFILE" == "auxinuxos" ]]; then
 
   # --- KVM: machines virtuelles depuis le bureau (Boxes, virt-manager) ------
   cfg --enable VIRTUALIZATION
+  # Sur arm64, KVM est un booléen unique (pas de variante Intel/AMD): les VM
+  # tournent à vitesse native sur Snapdragon X, RK3588 ou Ampere.
   cfg --enable KVM
-  cfg --module KVM_INTEL
-  cfg --module KVM_AMD
+  if is_x86; then
+    cfg --module KVM_INTEL
+    cfg --module KVM_AMD
+  fi
   cfg --module VHOST_NET
   cfg --module VHOST_VSOCK
   cfg --module VSOCKETS
   cfg --module VIRTIO_VSOCKETS
   cfg --enable PARAVIRT
-  cfg --enable PARAVIRT_SPINLOCKS
-  cfg --enable HYPERVISOR_GUEST
+  if is_x86; then
+    cfg --enable PARAVIRT_SPINLOCKS
+    cfg --enable HYPERVISOR_GUEST
+  fi
   # AuxiNuxOS s'installe et se valide aussi EN machine virtuelle: les pilotes
   # invités VirtIO de démarrage sont built-in pour ne pas dépendre d'un
   # initramfs correct dans ce cas non plus.
@@ -1928,14 +2168,23 @@ elif [[ "$PROFILE" == "auxinuxos" ]]; then
   cfg --module VIRTIO_BALLOON
   cfg --module VIRTIO_INPUT
   cfg --module VIRTIO_FS
+  # Machines virtuelles arm64: QEMU virt expose aussi des périphériques virtio
+  # sur bus MMIO, sans PCI. C'est le cas d'usage ARM le plus courant d'un poste
+  # de travail: AuxiNuxOS invité sur un Mac Apple Silicon.
+  is_x86 || cfg --enable VIRTIO_MMIO
   # IOMMU: passthrough occasionnel (eGPU, carte son USB dédiée, VM GPU).
   # INTEL_IOMMU_DEFAULT_ON reste volontairement à l'écart: l'activer par défaut
   # casse le démarrage de certaines cartes anciennes. Opt-in documenté:
   # intel_iommu=on iommu=pt
   cfg --enable IOMMU_SUPPORT
-  cfg --enable INTEL_IOMMU
-  cfg --enable AMD_IOMMU
-  cfg --enable IRQ_REMAP
+  if is_x86; then
+    cfg --enable INTEL_IOMMU
+    cfg --enable AMD_IOMMU
+    cfg --enable IRQ_REMAP
+  else
+    cfg --enable ARM_SMMU               # SMMUv2: Snapdragon, RK3588
+    cfg --enable ARM_SMMU_V3            # SMMUv3: Ampere, CIX P1, serveurs
+  fi
   cfg --module VFIO
   cfg --module VFIO_PCI
 
@@ -1953,33 +2202,53 @@ elif [[ "$PROFILE" == "auxinuxos" ]]; then
   cfg --module ACPI_BUTTON
   cfg --module ACPI_FAN
   cfg --module ACPI_THERMAL
-  cfg --enable ACPI_DOCK
   cfg --enable ACPI_PROCESSOR
-  cfg --module ACPI_WMI
-  cfg --enable X86_PLATFORM_DEVICES
-  cfg --module THINKPAD_ACPI
-  cfg --module ASUS_WMI
-  cfg --module ASUS_NB_WMI
-  cfg --module DELL_LAPTOP
-  cfg --module DELL_WMI
-  cfg --module DELL_SMBIOS
-  cfg --module HP_WMI
-  cfg --module ACER_WMI
-  cfg --module MSI_WMI
-  cfg --module LENOVO_YMC
-  cfg --module INTEL_HID_EVENT
-  cfg --module INTEL_VBTN
-  cfg --module INTEL_PMC_CORE
-  cfg --module AMD_PMC
-  cfg --module AMD_PMF                # gestion thermique/plateforme AMD récente
   cfg --enable THERMAL
-  cfg --module X86_PKG_TEMP_THERMAL
-  cfg --module INT340X_THERMAL
   cfg --enable HWMON
-  cfg --module SENSORS_CORETEMP
-  cfg --module SENSORS_K10TEMP
-  cfg --module SENSORS_NCT6775
-  cfg --module SENSORS_DELL_SMM
+  if is_x86; then
+    cfg --enable ACPI_DOCK
+    cfg --module ACPI_WMI
+    cfg --enable X86_PLATFORM_DEVICES
+    cfg --module THINKPAD_ACPI
+    cfg --module ASUS_WMI
+    cfg --module ASUS_NB_WMI
+    cfg --module DELL_LAPTOP
+    cfg --module DELL_WMI
+    cfg --module DELL_SMBIOS
+    cfg --module HP_WMI
+    cfg --module ACER_WMI
+    cfg --module MSI_WMI
+    cfg --module LENOVO_YMC
+    cfg --module INTEL_HID_EVENT
+    cfg --module INTEL_VBTN
+    cfg --module INTEL_PMC_CORE
+    cfg --module AMD_PMC
+    cfg --module AMD_PMF              # gestion thermique/plateforme AMD récente
+    cfg --module X86_PKG_TEMP_THERMAL
+    cfg --module INT340X_THERMAL
+    cfg --module SENSORS_CORETEMP
+    cfg --module SENSORS_K10TEMP
+    cfg --module SENSORS_NCT6775
+    cfg --module SENSORS_DELL_SMM
+  else
+    # Portables Snapdragon X: pas de WMI. Batterie, charge USB-C et touches
+    # passent par le contrôleur embarqué (EC) de chaque modèle et par les
+    # coprocesseurs Qualcomm (ADSP), joints via pmic_glink. Sans eux, la
+    # machine démarre mais n'affiche ni batterie ni adaptateur secteur.
+    cfg --module BATTERY_QCOM_BATTMGR
+    cfg --module UCSI_PMIC_GLINK
+    cfg --module QCOM_PD_MAPPER
+    cfg --module EC_LENOVO_THINKPAD_T14S
+    cfg --module EC_LENOVO_YOGA_C630
+    cfg --module EC_ACER_ASPIRE1
+    cfg --module EC_HUAWEI_GAOKUN
+    # Refroidissement: frein thermique des cœurs, capteurs SCMI, et ventilateur
+    # PWM des cartes RK3588 et du Raspberry Pi 5 — sans pwm-fan, le ventilateur
+    # reste arrêté ou à fond.
+    cfg --enable CPU_THERMAL
+    cfg --module SENSORS_ARM_SCMI
+    cfg --module SENSORS_PWM_FAN
+  fi
   cfg --enable PCIEASPM
   cfg --enable PCIEASPM_DEFAULT       # économie d'énergie PCIe par défaut
 
@@ -2007,6 +2276,15 @@ elif [[ "$PROFILE" == "auxinuxos" ]]; then
   cfg --module IGC
   cfg --module ALX
   cfg --module ATL1C
+  if ! is_x86; then
+    # Raspberry Pi 5: RP1 est la puce d'E/S qui porte USB, Ethernet et GPIO.
+    # Sans MISC_RP1, un Pi 5 n'a ni clavier USB ni réseau.
+    cfg --module MISC_RP1
+    cfg --module MACB                 # Ethernet du Pi 5 (via RP1)
+    cfg --module BCMGENET             # Ethernet du Pi 4
+    cfg --module STMMAC_ETH           # Ethernet intégré Rockchip, Allwinner, Amlogic
+    cfg --module DWMAC_ROCKCHIP
+  fi
 
   # --- Wi-Fi et Bluetooth ---------------------------------------------------
   # Corrections de noms révélées par le garde-fou au passage en 7.2:
@@ -2041,6 +2319,8 @@ elif [[ "$PROFILE" == "auxinuxos" ]]; then
   cfg --module MWIFIEX_PCIE
   cfg --module MWIFIEX_USB
   cfg --module RTL8XXXU
+  # Wi-Fi des Raspberry Pi: puce Broadcom sur bus SDIO.
+  is_x86 || cfg --enable BRCMFMAC_SDIO
   cfg --module BT
   cfg --module BT_HCIBTUSB
   cfg --module BT_HCIUART
@@ -2048,6 +2328,13 @@ elif [[ "$PROFILE" == "auxinuxos" ]]; then
   cfg --module BT_BNEP
   cfg --module BT_HIDP                # claviers, souris et manettes Bluetooth
   cfg --enable BT_LE
+  if ! is_x86; then
+    # Sur ARM, le Bluetooth intégré est souvent relié en UART au SoC (Pi,
+    # Snapdragon WCN), énuméré par le device tree via serdev.
+    cfg --enable SERIAL_DEV_BUS
+    cfg --enable BT_HCIUART_BCM
+    cfg --enable BT_HCIUART_QCA
+  fi
 
   # ==========================================================================
   # Sécurité
@@ -2073,15 +2360,38 @@ elif [[ "$PROFILE" == "auxinuxos" ]]; then
   # couper est un choix d'exploitation que l'utilisateur peut faire au boot
   # avec mitigations=off — pas un choix de build qu'on impose à tout le parc.
   cfg --enable CPU_MITIGATIONS
-  cfg --enable MITIGATION_PAGE_TABLE_ISOLATION
-  cfg --enable MITIGATION_RETPOLINE
-  cfg --enable MITIGATION_SPECTRE_V1
-  cfg --enable MITIGATION_SPECTRE_V2
-  cfg --enable MITIGATION_RETHUNK
-  cfg --enable MITIGATION_SRSO
-  cfg --enable MITIGATION_MDS
-  cfg --enable MITIGATION_L1TF
-  cfg --enable MITIGATION_VMSCAPE
+  if is_x86; then
+    cfg --enable MITIGATION_PAGE_TABLE_ISOLATION
+    cfg --enable MITIGATION_RETPOLINE
+    cfg --enable MITIGATION_SPECTRE_V1
+    cfg --enable MITIGATION_SPECTRE_V2
+    cfg --enable MITIGATION_RETHUNK
+    cfg --enable MITIGATION_SRSO
+    cfg --enable MITIGATION_MDS
+    cfg --enable MITIGATION_L1TF
+    cfg --enable MITIGATION_VMSCAPE
+  else
+    # Équivalents ARM64: KPTI (Meltdown, Cortex-A75) et Spectre-BHB. Le noyau
+    # n'active ces protections que sur les cœurs qui en ont besoin.
+    cfg --enable UNMAP_KERNEL_AT_EL0
+    cfg --enable MITIGATE_SPECTRE_BRANCH_HISTORY
+    # Durcissement matériel ARMv8.3+ / v8.5+, sans coût sur les cœurs qui ne
+    # l'ont pas: pointeurs signés (PAC) et cibles de saut contrôlées (BTI)
+    # contre le détournement de flot d'exécution, E0PD contre les fuites
+    # d'adresses noyau par canal auxiliaire, MTE pour l'étiquetage mémoire,
+    # GCS pour la pile fantôme matérielle en espace utilisateur.
+    cfg --enable ARM64_PTR_AUTH
+    cfg --enable ARM64_PTR_AUTH_KERNEL
+    cfg --enable ARM64_BTI
+    cfg --enable ARM64_E0PD
+    cfg --enable ARM64_MTE
+    cfg --enable ARM64_GCS
+    # SVE/SME: instructions vectorielles des cœurs récents (Neoverse V, Cortex-
+    # X925, Apple M4 en VM), exploitées par les codecs et les bibliothèques
+    # mathématiques. Le noyau doit gérer leur contexte pour qu'elles existent.
+    cfg --enable ARM64_SVE
+    cfg --enable ARM64_SME
+  fi
 
   # --- Prérequis systemd (fichier REQUIREMENTS amont) -----------------------
   # Jusqu'ici hérités par chance de la config Debian, jamais vérifiés.
@@ -2098,14 +2408,24 @@ elif [[ "$PROFILE" == "auxinuxos" ]]; then
   cfg --enable PROC_FS
   cfg --enable SYSFS
   cfg --enable BINFMT_ELF
-  cfg --module BINFMT_MISC            # exécution des .exe via la couche Windows
+  # Exécution des .exe via la couche Windows; sur arm64, c'est aussi par là
+  # que FEX-Emu et Box64 s'enregistrent pour lancer Steam et tout binaire x86-64.
+  cfg --module BINFMT_MISC
   # Binaires 32 bits: Steam, Wine/Proton, quelques installeurs propriétaires.
   # IA32_EMULATION seul ne suffit plus depuis 6.7: si
   # IA32_EMULATION_DEFAULT_DISABLED est activé, le support est compilé mais
   # inerte tant qu'on ne passe pas ia32_emulation=1 au boot — un Steam qui
   # refuse de démarrer sans le moindre message utile.
-  cfg --enable IA32_EMULATION
-  cfg --disable IA32_EMULATION_DEFAULT_DISABLED
+  if is_x86; then
+    cfg --enable IA32_EMULATION
+    cfg --disable IA32_EMULATION_DEFAULT_DISABLED
+  else
+    # Équivalent ARM64: les binaires armhf 32 bits (Box86, anciens paquets
+    # Raspberry Pi OS). Inerte sur les cœurs sans AArch32 (Snapdragon X,
+    # Cortex-A720+), sans coût ailleurs. Les binaires x86-64 passent, eux, par
+    # FEX-Emu ou Box64 enregistrés dans BINFMT_MISC ci-dessus.
+    cfg --enable COMPAT
+  fi
 
   # --- Diagnostic et dernier recours ----------------------------------------
   # Alt+SysRq+REISUB permet de redémarrer proprement une session graphique
@@ -2118,9 +2438,13 @@ elif [[ "$PROFILE" == "auxinuxos" ]]; then
   # des booléens: --disable y serait un no-op. 0 = tracer et continuer.
   cfg --set-val BOOTPARAM_SOFTLOCKUP_PANIC 0
   cfg --set-val BOOTPARAM_HUNG_TASK_PANIC 0
-  cfg --enable X86_MCE
-  cfg --enable X86_MCE_INTEL
-  cfg --enable X86_MCE_AMD
+  if is_x86; then
+    cfg --enable X86_MCE
+    cfg --enable X86_MCE_INTEL
+    cfg --enable X86_MCE_AMD
+  else
+    cfg --enable ARM64_RAS_EXTN        # erreurs matérielles ARMv8.2 RAS
+  fi
   cfg --enable RAS
   cfg --enable PSTORE
   cfg --enable TASK_DELAY_ACCT
@@ -2267,7 +2591,7 @@ else
     # Rollback: overlay inscriptible sur instantané en lecture seule.
     OVERLAY_FS TMPFS_XATTR
     # Fluidité: PSI est le prérequis dur de systemd-oomd.
-    PSI MEMCG ZRAM LRU_GEN
+    PSI MEMCG ZRAM LRU_GEN SCHED_AUTOGROUP
     # Conteneurs LXC/Docker.
     CGROUPS CGROUP_SCHED BLK_CGROUP NAMESPACES USER_NS NET_NS PID_NS
     SECCOMP VETH BRIDGE TUN SECURITY_APPARMOR
@@ -2280,8 +2604,16 @@ else
     # Flatpak / AppImage.
     FUSE_FS
     # Plateforme CPU.
-    MICROCODE CPU_FREQ
+    CPU_FREQ
   )
+  if is_x86; then
+    CRITICAL+=(MICROCODE)
+  else
+    # Pages de 4 Ko: sans elles, FEX-Emu/Box64 (Steam, Proton) et Chromium
+    # cassent. EAS: sans modèle énergétique, big.LITTLE est ordonnancé à
+    # l'aveugle. CPUFREQ_DT/SCMI: sans eux, le SoC reste à sa fréquence plancher.
+    CRITICAL+=(ARM64_4K_PAGES ENERGY_MODEL CPUFREQ_DT ARM_SCMI_CPUFREQ ACPI_CPPC_CPUFREQ)
+  fi
 
   # Options qui DOIVENT être compilées en dur, pas en module: monter la racine
   # ou démarrer sur un instantané ne doit dépendre d'aucun initramfs.
@@ -2295,30 +2627,51 @@ else
     DRM DRM_SIMPLEDRM SYSFB_SIMPLEFB FRAMEBUFFER_CONSOLE
     EFIVAR_FS
   )
+  # arm64: la racine d'une VM ou d'une station UEFI est derrière le contrôleur
+  # PCIe générique; celle d'une carte ARM, sur SD/eMMC.
+  is_x86 || CRITICAL_BUILTIN+=(PCI_HOST_GENERIC VIRTIO_MMIO MMC MMC_BLOCK)
 
   RECOMMENDED=(
-    # GPU: les trois constructeurs.
-    DRM_I915 DRM_XE DRM_AMDGPU DRM_AMD_DC DRM_NOUVEAU DRM_RADEON
+    # GPU PCIe.
+    DRM_XE DRM_AMDGPU DRM_AMD_DC DRM_NOUVEAU DRM_RADEON
     DRM_FBDEV_EMULATION BACKLIGHT_CLASS_DEVICE
-    # Audio moderne (SOF) et amplificateurs de portables.
+    # Audio.
     SND_HDA_INTEL SND_HDA_CODEC_REALTEK SND_HDA_CODEC_HDMI SND_USB_AUDIO
-    SND_SOC_SOF_INTEL_TOPLEVEL
     # Jeu.
     NTSYNC JOYSTICK_XPAD HID_PLAYSTATION HID_NINTENDO HID_STEAM INPUT_JOYDEV
-    IA32_EMULATION
+    BINFMT_MISC
     # Fluidité.
-    PREEMPT_DYNAMIC SCHED_AUTOGROUP UCLAMP_TASK IOSCHED_BFQ BLK_WBT
-    ZRAM_WRITEBACK LRU_GEN_ENABLED X86_INTEL_PSTATE X86_AMD_PSTATE
+    PREEMPT_DYNAMIC UCLAMP_TASK IOSCHED_BFQ BLK_WBT
+    ZRAM_WRITEBACK LRU_GEN_ENABLED
     # Conteneurs et virtualisation.
-    KVM KVM_INTEL KVM_AMD NF_TABLES NF_NAT IP_NF_TARGET_MASQUERADE
+    KVM NF_TABLES NF_NAT IP_NF_TARGET_MASQUERADE
     CGROUP_HUGETLB CFS_BANDWIDTH CHECKPOINT_RESTORE SECURITY_LANDLOCK
     # Périphériques.
     BT_HCIBTUSB IWLWIFI IWLMVM IWLMLD ATH10K ATH11K ATH12K
     MT7921E MT7925E RTW88 RTW89 BRCMFMAC
-    USB4 MMC_SDHCI EXFAT_FS NTFS3_FS XFS_FS
+    USB4 EXFAT_FS NTFS3_FS XFS_FS
     # Portable.
-    SUSPEND HIBERNATION THINKPAD_ACPI THERMAL HWMON
+    SUSPEND HIBERNATION THERMAL HWMON
   )
+  if is_x86; then
+    RECOMMENDED+=(
+      DRM_I915 SND_SOC_SOF_INTEL_TOPLEVEL IA32_EMULATION
+      X86_INTEL_PSTATE X86_AMD_PSTATE KVM_INTEL KVM_AMD
+      MMC_SDHCI THINKPAD_ACPI
+    )
+  else
+    RECOMMENDED+=(
+      # GPU et décodage vidéo des SoC.
+      DRM_PANTHOR DRM_PANFROST DRM_MSM DRM_V3D DRM_VC4 DRM_ROCKCHIP
+      VIDEO_HANTRO VIDEO_ROCKCHIP_VDEC
+      # Fluidité et sécurité propres à ARM.
+      ARM64_AMU_EXTN ARM64_CONTPTE ARM_PSCI_CPUIDLE COMPAT
+      ARM64_PTR_AUTH ARM64_BTI ARM_SMMU_V3
+      # Raspberry Pi 5, Snapdragon X.
+      MISC_RP1 BRCMFMAC_SDIO BATTERY_QCOM_BATTMGR SND_SOC_X1E80100
+      SENSORS_PWM_FAN
+    )
+  fi
 fi
 
 missing_crit=()

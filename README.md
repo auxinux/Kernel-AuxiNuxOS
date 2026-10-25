@@ -9,14 +9,16 @@ peut être cloné et utilisé sans Kernel/VirtuaOS.
 
 ```bash
 ./build-AuxiNuxOS-kernel.sh -config-only      # build à blanc: vérifie la config
-./build-AuxiNuxOS-kernel.sh                   # build complet
+./build-AuxiNuxOS-kernel.sh                   # build complet amd64
+./build-AuxiNuxOS-kernel.sh -arch=arm64       # build complet arm64 (croisé)
 sudo GPG_KEY=repo@auxinux.ca ./build-depot-AuxiNuxOS.sh ./output
 ```
 
 | | |
 |---|---|
 | Série noyau | **7.2.x** (`--branch=7.2` par défaut) |
-| Release produite | `X.Y.Z-auxinuxos-amd64` |
+| Architectures | **amd64** et **arm64** |
+| Release produite | `X.Y.Z-auxinuxos-amd64`, `X.Y.Z-auxinuxos-arm64` |
 | Paquet meta | `kernel-auxinuxos` |
 | Suite APT | `kernel` — `https://dep.auxinux.ca/AUXINUXOS` |
 
@@ -42,6 +44,47 @@ choix de configuration et leur justification sont dans
 * **Rollback** — voir ci-dessous.
 * **Conteneurs** — pile cgroups v2 complète, `NETFILTER_XTABLES_LEGACY` (requis
   par `docker` et `lxc-net` depuis 7.x), et la chaîne LSM exacte de Debian 13.
+
+## ARM64
+
+Le même profil `auxinuxos` produit un noyau arm64, compilé en croisé depuis le
+serveur de build amd64 (`gcc-aarch64-linux-gnu`). Tout le cahier des charges du
+poste de travail est conservé — préemption complète à 1000 Hz, MGLRU, PSI,
+ZRAM, BTF, rollback BTRFS, LXC/Docker/KVM, modules en xz — et chaque section
+spécifique à x86 a son équivalent ARM.
+
+**Config de base.** C'est la config du noyau **Debian arm64** de
+`trixie-backports`, téléchargée et vérifiée à chaque build (InRelease par
+`gpgv` contre `debian-archive-keyring`, puis SHA256 de `Packages.xz` et du
+`.deb`) — l'exact pendant de `/boot/config-*-amd64` côté x86. L'ancien repli
+`make defconfig` donnait un noyau de carte d'évaluation sans rapport avec
+Debian. `BASE_CONFIG_ARM64=/chemin` force une config précise (build hors ligne).
+
+| Côté x86 | Équivalent arm64 |
+|---|---|
+| i915, SOF Intel/AMD | Panthor, Panfrost, Lima, MSM (Adreno), V3D/VC4, Rockchip, Tegra, Etnaviv ; cartes son DT, Snapdragon X |
+| VA-API par le GPU | décodeurs V4L2 dédiés : Hantro, rkvdec, Venus |
+| intel/amd-pstate, acpi-cpufreq | cpufreq-dt, SCMI, CPPC, Qualcomm, Raspberry Pi ; cpuidle PSCI |
+| Turbo Boost Max (`SCHED_MC_PRIO`) | **Energy Aware Scheduling** (`ENERGY_MODEL`) + AMU pour big.LITTLE |
+| — | pages **4 Ko** obligatoires (FEX-Emu, Box64, Wine, Chromium), `ARM64_CONTPTE` |
+| `IA32_EMULATION` | `COMPAT` (armhf) ; les binaires x86-64 passent par FEX/Box64 via `BINFMT_MISC` |
+| AES-NI | extensions Crypto ARMv8 |
+| KVM Intel/AMD, VT-d/AMD-Vi | KVM arm64, SMMUv2/v3 |
+| WMI constructeurs | EC des portables Snapdragon X, batterie `pmic_glink`, `pwm-fan` |
+| Mitigations x86 | KPTI, Spectre-BHB, PAC, BTI, E0PD, MTE, GCS |
+| `vmlinuz` zstd | `Image.gz`, comme Debian : `EFI_ZBOOT` n'est pas lisible par U-Boot `booti` |
+
+Machines visées : VM arm64 (QEMU/UTM/Parallels/VMware Fusion sur Mac Apple
+Silicon — virtio-PCI et virtio-MMIO en built-in), Raspberry Pi 4/5, cartes
+RK3588 (Orange Pi 5, Rock 5), portables Snapdragon X, stations Ampere/CIX.
+Les Mac Apple Silicon **en natif** ne sont pas visés : leur support amont est
+incomplet et suppose des pages de 16 Ko.
+
+Le contrôle « racine montable sans initramfs » ajoute sur arm64
+`PCI_HOST_GENERIC`, `VIRTIO_MMIO`, `MMC` et `MMC_BLOCK` à la liste
+`CRITICAL_BUILTIN`. Sur les cartes ARM, le contrôleur SD/eMMC lui-même reste en
+module (horloges et régulateurs le sont aussi) : la garantie complète vaut pour
+les VM et les machines UEFI/ACPI.
 
 ## Rollback : ce que le noyau doit garantir
 
@@ -125,7 +168,7 @@ Rétention par défaut : `KEEP_VERSIONS=2` par série et par architecture.
 sudo wget -O /usr/share/keyrings/auxinuxos-archive-keyring.gpg \
   https://dep.auxinux.ca/AUXINUXOS/auxinuxos-archive-keyring.gpg
 
-echo 'deb [signed-by=/usr/share/keyrings/auxinuxos-archive-keyring.gpg arch=amd64] https://dep.auxinux.ca/AUXINUXOS kernel main' \
+echo "deb [signed-by=/usr/share/keyrings/auxinuxos-archive-keyring.gpg arch=$(dpkg --print-architecture)] https://dep.auxinux.ca/AUXINUXOS kernel main" \
   | sudo tee /etc/apt/sources.list.d/auxinuxos-kernel.list
 
 sudo apt update && sudo apt install kernel-auxinuxos

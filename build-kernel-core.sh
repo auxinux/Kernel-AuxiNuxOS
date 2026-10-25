@@ -463,14 +463,18 @@ case "$TARGET_ARCH" in
     KBUILD_ARCH="arm64"
     KBUILD_DEBARCH="arm64"
     DEFAULT_CROSS_COMPILE="aarch64-linux-gnu-"
-    ARCH_DEPS=(gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu)
+    ARCH_DEPS=(gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu libssl-dev:arm64)
     ;;
   arm64)
     KERNEL_ARCH_SUFFIX="arm64"
     KBUILD_ARCH="arm64"
     KBUILD_DEBARCH="arm64"
     DEFAULT_CROSS_COMPILE="aarch64-linux-gnu-"
-    ARCH_DEPS=(gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu)
+    # libssl-dev:arm64 (multiarch): le paquet linux-headers recompile ses
+    # outils hôtes POUR la cible (install-extmod-build), dont sign-file qui se
+    # lie à libcrypto. Le debian/control généré l'exige donc en version arm64;
+    # sans elle, dpkg-checkbuilddeps arrête bindeb-pkg avant toute compilation.
+    ARCH_DEPS=(gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu libssl-dev:arm64)
     ;;
   *)
     echo "ERREUR: architecture invalide: ${TARGET_ARCH}. Valeurs supportées: amd64, arm, arm64." >&2
@@ -932,6 +936,17 @@ ZFS_DEPS=(
 if [[ "$WITH_ZFS" == "1" ]]; then
   COMMON_DEPS+=("${ZFS_DEPS[@]}")
 fi
+
+# Une dépendance ":arm64" n'est installable qu'une fois l'architecture
+# étrangère déclarée à dpkg.
+for _dep in ${ARCH_DEPS[@]+"${ARCH_DEPS[@]}"}; do
+  if [[ "$_dep" == *:* ]] && ! { [[ "$(dpkg --print-architecture)" == "${_dep##*:}" ]] \
+      || dpkg --print-foreign-architectures | grep -qx "${_dep##*:}"; }; then
+    echo "Ajout de l'architecture dpkg ${_dep##*:} (multiarch)..."
+    sudo dpkg --add-architecture "${_dep##*:}"
+    sudo apt update
+  fi
+done
 
 if [[ "$SOURCE" == "debian" ]]; then
   # Détection de KERNEL_MAJOR si auto

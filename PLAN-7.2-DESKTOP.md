@@ -371,6 +371,25 @@ Le 7.3 a suivi, publié depuis un staging neuf `~/incoming/auxinuxos-dev-7.3`
 au construit, `InRelease` des deux suites signé valide. Ni le 7.2.11 ni le 7.3
 n'ont encore démarré sur du matériel réel.
 
+**ARM64, 7.2.12 (25 octobre 2026).** Premier noyau arm64, compilé en croisé
+sur `virtua-dev` (quota de 2 CPU : ~7 h 15 de 21 h 10 à 4 h 26). Base : config
+Debian `linux-base-7.2.11+deb13-arm64` vérifiée GPG. Un premier lancement s'est
+arrêté à `dpkg-checkbuilddeps` (`libssl-dev:arm64` manquant pour recompiler
+`sign-file`/`modpost` du paquet headers pour la cible) — corrigé dans le
+moteur, et `modpost`/`sign-file` du paquet publié sont bien des ELF aarch64.
+Image : `vmlinuz` Image.gz, 4 322 modules xz. Publié depuis un staging neuf
+`~/incoming/staging-arm64-7.2.12-20261025114343`, sans sauvegarde préalable :
+la purge et le meta étant par architecture, l'amd64 n'était pas exposé — et il
+est resté intact (7.2.11 + 7.2.5). Index `binary-arm64` à 3 paquets, meta
+`kernel-auxinuxos` arm64 en 7.2.12 avec `Depends` correct, HTTP 200, sha256
+servi identique au construit, `InRelease` des deux suites signé valide.
+**Pas encore démarré sur du matériel ARM réel.**
+
+```
+KERNEL/  amd64  kernel-auxinuxos 7.2.11-auxinuxos-amd64.1  (+ 7.2.5 de repli)
+         arm64  kernel-auxinuxos 7.2.12-auxinuxos-arm64.1
+```
+
 **Image 7.3 plus légère (115 Mo contre 165 Mo)** : ce n'est pas un manque. Les
 deux noyaux ont `DEBUG_INFO_BTF_MODULES=y`, mais en 7.2.x la section `.BTF` des
 modules est gonflée (24 Ko pour `rc-winfast-usbii-deluxe`, contre 1,1 Ko en

@@ -405,6 +405,22 @@ KERNEL/  amd64  kernel-auxinuxos 7.2.13-auxinuxos-amd64.1  (+ 7.2.11 de repli)
          arm64  kernel-auxinuxos 7.2.12-auxinuxos-arm64.1
 ```
 
+**AMD64, 7.2.13 (27 octobre 2026).** Config issue du build à blanc identique
+à celle de la 7.2.11 publiée (hors commentaires) — le moteur modifié pour
+l'arm64 ne change donc rien à l'amd64. Compilé sur `virtua-dev` de 14 h 24 à
+19 h 09 (~4 h 45, quota de 2 CPU), journal `~/build-logs/build-amd64-7.2.13.log`.
+Image : 4 045 modules xz. Publié en prod depuis un staging neuf
+`~/incoming/staging-amd64-7.2.13-*`, rétention par défaut (`KEEP_VERSIONS=2`) :
+la 7.2.11 reste en repli, la 7.2.5 est purgée (HTTP 404), l'arm64 7.2.12 est
+intact. Meta `kernel-auxinuxos` amd64 en 7.2.13 avec `Depends` correct, HTTP
+200, sha256 servi identique au construit, `InRelease` des deux suites signé
+valide. **Pas encore démarré sur du matériel réel.**
+
+```
+KERNEL/  amd64  kernel-auxinuxos 7.2.13-auxinuxos-amd64.1  (+ 7.2.11 de repli)
+         arm64  kernel-auxinuxos 7.2.12-auxinuxos-arm64.1
+```
+
 **Image 7.3 plus légère (115 Mo contre 165 Mo)** : ce n'est pas un manque. Les
 deux noyaux ont `DEBUG_INFO_BTF_MODULES=y`, mais en 7.2.x la section `.BTF` des
 modules est gonflée (24 Ko pour `rc-winfast-usbii-deluxe`, contre 1,1 Ko en

@@ -16,7 +16,7 @@ sudo GPG_KEY=repo@auxinux.ca ./build-depot-AuxiNuxOS.sh ./output
 
 | | |
 |---|---|
-| Série noyau | **7.2.x** (`--branch=7.2` par défaut) |
+| Série noyau | **7.3.x** en prod (`--branch=7.3` par défaut), **7.4.x** en dev |
 | Architectures | **amd64** et **arm64** |
 | Release produite | `X.Y.Z-auxinuxos-amd64`, `X.Y.Z-auxinuxos-arm64` |
 | Paquet meta | `kernel-auxinuxos` |
@@ -125,29 +125,31 @@ MediaTek ni Wi-Fi 7 Qualcomm garanti, sans qu'aucune étape ne le signale.
 
 ## Séries et canaux
 
-La **série** est épinglée, pas la révision : `--branch=7.2` suit 7.2.5, puis
-7.2.6… sans jamais sauter tout seul sur 7.3. Un changement de série change les
+La **série** est épinglée, pas la révision : `--branch=7.3` suit 7.3.1, puis
+7.3.2… sans jamais sauter tout seul sur 7.4. Un changement de série change les
 pilotes et les options ; il se décide.
 
 ```bash
-./build-AuxiNuxOS-kernel.sh                    # dernière 7.2.x
-./build-AuxiNuxOS-kernel.sh --branch=7.3       # changer de série, sciemment
+./build-AuxiNuxOS-kernel.sh                    # dernière 7.3.x
+./build-AuxiNuxOS-kernel.sh --branch=7.4       # changer de série, sciemment
 ./build-AuxiNuxOS-kernel.sh --branch=any       # suivre la dernière stable
 ```
 
-> La série **7.1 est EOL depuis le 2026-09-02** et ne reçoit plus de correctif
-> de sécurité. Le wrapper avertit si la version résolue est marquée EOL.
+> La série **7.2 est marquée EOL** sur kernel.org depuis 7.2.15 et ne recevra
+> plus de correctif de sécurité. Le wrapper avertit si la version résolue est
+> marquée EOL.
 
 Deux canaux de publication coexistent, physiquement séparés côté dépôt :
 
 | Canal | Release noyau | Meta-paquet | Suite APT | Dossier |
 |---|---|---|---|---|
-| `prod` (défaut) | `X.Y.Z-auxinuxos-amd64` | `kernel-auxinuxos` | `kernel` | `KERNEL/` |
-| `dev` | `X.Y.Z-dev-auxinuxos-amd64` | `kernel-auxinuxos-dev` | `kernel-dev` | `KERNEL-DEV/` |
+| `prod` (défaut, série 7.3) | `X.Y.Z-auxinuxos-amd64` | `kernel-auxinuxos` | `kernel` | `KERNEL/` |
+| `dev` (série 7.4) | `X.Y.Z-dev-auxinuxos-amd64` | `kernel-auxinuxos-dev` | `kernel-dev` | `KERNEL-DEV/` |
 
 ```bash
 ./build-AuxiNuxOS-kernel.sh                          # prod
-./build-AuxiNuxOS-kernel.sh track=dev                # dev
+./build-AuxiNuxOS-kernel.sh track=dev                # dev, dernière 7.4.x
+./build-AuxiNuxOS-kernel.sh track=dev --channel=mainline   # 7.4-rcN, tant que la 7.4 n'est pas stable
 sudo RELEASE_TRACK=dev GPG_KEY=repo@auxinux.ca ./build-depot-AuxiNuxOS.sh /tmp/dev
 ```
 
@@ -160,7 +162,9 @@ interdit les majuscules dans un nom de paquet et `dpkg` les convertit
 silencieusement, ce qui désynchroniserait le nom du paquet du répertoire
 `/lib/modules/$(uname -r)`.
 
-Rétention par défaut : `KEEP_VERSIONS=2` par série et par architecture.
+Rétention par défaut : `KEEP_VERSIONS=2` par paquet et par architecture, **toutes
+séries confondues** : publier une nouvelle version retire la plus ancienne, même
+si elle appartient à une autre série.
 
 ## Configuration client
 

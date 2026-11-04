@@ -4,16 +4,21 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BUILDER="${SCRIPT_DIR}/build-kernel-core.sh"
 CHANNEL="current"
-# Série noyau de production d'AuxiNuxOS.
+# Séries noyau d'AuxiNuxOS: 7.3 en production, 7.4 en développement.
 #
-# On épingle la SÉRIE, pas la révision: --branch=7.2 suit 7.2.5, puis 7.2.6...
-# sans jamais sauter tout seul sur 7.3 le jour où kernel.org la publie. Un
+# On épingle la SÉRIE, pas la révision: --branch=7.3 suit 7.3.1, puis 7.3.2...
+# sans jamais sauter tout seul sur 7.4 le jour où kernel.org la publie. Un
 # changement de série change les pilotes et les options de configuration; il
 # se décide, il ne s'attrape pas au détour d'un build automatique.
 #
-# La série 7.1 a été marquée EOL le 2026-09-02: elle ne reçoit plus aucun
-# correctif de sécurité. C'est ce qui motive le passage à 7.2.
-BRANCH="${AUXINUXOS_KERNEL_BRANCH:-7.2}"
+# La série 7.2 est marquée EOL sur kernel.org depuis 7.2.15: elle ne recevra
+# plus de correctif de sécurité. La 7.3 a été validée en canal dev (7.3.1).
+PROD_BRANCH="7.3"
+DEV_BRANCH="7.4"
+BRANCH="${AUXINUXOS_KERNEL_BRANCH:-}"
+BRANCH_SET=0
+[[ -n "${AUXINUXOS_KERNEL_BRANCH:-}" ]] && BRANCH_SET=1
+TRACK="${RELEASE_TRACK:-prod}"
 PASSTHROUGH=()
 ZFS_OPTION_SET=0
 
@@ -28,19 +33,22 @@ AuxiNuxOS BTRFS rollback. On arm64 the same profile adds SoC GPUs (Mali,
 Adreno, VideoCore), Energy Aware Scheduling and 4K pages for FEX/Box64, on top
 of the GPG-verified Debian arm64 config.
 
-Default: latest non-RC release of the 7.2 series, amd64.
+Default: latest non-RC release of the 7.3 series, amd64.
 
 Usage:
   $0 [--channel=current|lts|mainline] [--branch=X.Y] [builder options]
   $0 -h | --help
 
 Kernel series:
-  AuxiNuxOS production tracks the 7.2 series by default (--branch=7.2).
-  The 7.1 series went EOL on 2026-09-02 and no longer receives security
-  fixes. Pinning the SERIES, not the revision, means 7.2.5 -> 7.2.6 -> ...
-  happen on their own while a jump to 7.3 stays an explicit decision.
+  AuxiNuxOS production tracks the 7.3 series by default (--branch=7.3) and
+  track=dev tracks the 7.4 series. The 7.2 series is EOL on kernel.org.
+  Pinning the SERIES, not the revision, means 7.3.1 -> 7.3.2 -> ... happen on
+  their own while a jump to 7.4 stays an explicit decision.
 
-  --branch=X.Y        Pin another series, for example --branch=7.3.
+  Until 7.4 has a stable release, track=dev needs --channel=mainline (7.4-rcN)
+  or an explicit KERNEL_VERSION=X.Y.Z.
+
+  --branch=X.Y        Pin another series, for example --branch=7.4.
   --branch=any        Follow the latest stable series, whatever it is.
 
 Release channels:
@@ -71,9 +79,10 @@ Architecture and build options are forwarded to the local kernel build engine:
   JOBS=N, BUILD_ROOT=/path, OUTPUT_DIR=/path, -docker, -docker-bg
 
 Examples:
-  $0                                        # latest 7.2.x, amd64
+  $0                                        # latest 7.3.x, amd64
+  $0 track=dev --channel=mainline           # 7.4-rcN, dev channel
   $0 -config-only                           # dry run: verify config only
-  $0 --branch=7.3 -arch=amd64               # move the production series
+  $0 --branch=7.4 -arch=amd64               # move the production series
   $0 --channel=lts --branch=6.18 -arch=amd64
   $0 --channel=mainline -arch=amd64
   $0 KERNEL_VERSION=7.2.5 -arch=arm64
@@ -100,12 +109,12 @@ for arg in "$@"; do
     channel=*) CHANNEL="${arg#*=}" ;;
     # --branch=any (ou vide) délie la série: on suit alors la dernière stable,
     # quelle qu'elle soit. À n'utiliser que sciemment.
-    --branch=any|branch=any|--branch=latest|branch=latest) BRANCH="" ;;
-    --branch=*) BRANCH="${arg#*=}" ;;
-    branch=*) BRANCH="${arg#*=}" ;;
+    --branch=any|branch=any|--branch=latest|branch=latest) BRANCH=""; BRANCH_SET=1 ;;
+    --branch=*) BRANCH="${arg#*=}"; BRANCH_SET=1 ;;
+    branch=*) BRANCH="${arg#*=}"; BRANCH_SET=1 ;;
     # Uniquement la forme track=... ici: les alias courts -dev/-prod seraient
     # confondus avec --dev, qui designe deja le canal mainline ci-dessous.
-    track=*|--track=*|RELEASE_TRACK=*) PASSTHROUGH+=("$arg") ;;
+    track=*|--track=*|RELEASE_TRACK=*) TRACK="${arg#*=}"; PASSTHROUGH+=("$arg") ;;
     --current|--stable|--latest) CHANNEL="current" ;;
     --lts|--longterm) CHANNEL="lts" ;;
     --mainline|--dev) CHANNEL="mainline" ;;
@@ -120,6 +129,11 @@ for arg in "$@"; do
     *) PASSTHROUGH+=("$arg") ;;
   esac
 done
+
+# Série par défaut selon le canal, une fois tous les arguments lus.
+if (( BRANCH_SET == 0 )); then
+  [[ "$TRACK" == "dev" ]] && BRANCH="$DEV_BRANCH" || BRANCH="$PROD_BRANCH"
+fi
 
 # A workstation kernel does not need kernel-coupled OpenZFS modules by default.
 # WITH_ZFS fourni par l'environnement compte aussi comme un choix explicite:

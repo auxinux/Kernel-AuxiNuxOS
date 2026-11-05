@@ -514,8 +514,13 @@ dev a été testée.
 ```
 KERNEL/      amd64  kernel-auxinuxos 7.3.1-auxinuxos-amd64.1  (+ 7.2.13 de repli)
              arm64  kernel-auxinuxos 7.2.12-auxinuxos-arm64.1
-KERNEL-DEV/  amd64  kernel-auxinuxos-dev 7.3.1-dev-auxinuxos-amd64.1  (+ 7.3.0-dev de repli)
+KERNEL-DEV/  amd64  kernel-auxinuxos-dev 7.3.1-dev-auxinuxos-amd64.1
 ```
+
+**Ménage (4 novembre).** Sur décision de l'utilisateur, le dépôt ne garde que la
+7.3.1 et la dernière 7.2.x publiée. La 7.3.0-dev est retirée de `kernel-dev`
+(HTTP 404), sauvegarde dans `~/kernel-backup-auxinuxos-dev-7.3.0-20261104-220616`
+sur `virtua-repo`. La suite prod n'a pas changé : elle était déjà conforme.
 
 ---
 

@@ -431,6 +431,44 @@ connu ; à creuser si la taille de la 7.2 importe.
 Les journaux `/tmp/build-*.log` ont été perdus au redémarrage de `virtua-dev`
 (18 h 22) : les prochains builds doivent journaliser hors de `/tmp`.
 
+### 10.7 Passage de la prod en 7.3 : 7.3.1 — 2 au 5 novembre 2026
+
+Premier build sur `homedev` (8 vrais cœurs, 7,8 Go de RAM + 7 Go de swap), sans
+manque de mémoire à 8 jobs. Les scripts de dépôt sont désormais dans
+`~/archive/Kernel-AuxiNuxOS` sur `virtua-repo`, identiques à `main` (sha256).
+
+**Dev, 7.3.1 (2 novembre).** Build à blanc d'abord : 479 options, toutes
+présentes, même avertissement bénin `SYSTEM_REVOCATION_KEYS`. Écart avec la
+config 7.3-dev : uniquement les variables `RUSTC_*`, `rustc` étant plus récent
+sur `homedev` (`CONFIG_RUST` non activé). Compilé en ~1 h 07. Publié dans
+`kernel-dev`, avec un effet non prévu : la 7.2.9-dev a été purgée. La rétention
+s'applique par paquet et par architecture, toutes séries confondues, et non par
+série comme l'indiquait le README, corrigé depuis. Les paquets restent dans
+`~/incoming/auxinuxos-dev-7.2.9` sur `virtua-repo`. Testé plusieurs jours par
+l'utilisateur sur sa machine, sans problème signalé.
+
+**Décision (4 novembre).** La 7.3.x devient la série de production et la 7.4.x
+celle du canal dev, défauts inscrits dans le wrapper (`cf64e41`). kernel.org
+marque la 7.2 EOL depuis la 7.2.15. Tant que la 7.4 n'a pas de version stable,
+`track=dev` exige `--channel=mainline`. L'arm64 est mis de côté pour le moment
+et reste en 7.2.12, sur une série EOL.
+
+**Prod, 7.3.1 (4 novembre).** Config identique à la 7.3.1-dev testée, hors
+`LOCALVERSION`. Compilé de 17 h 59 à 19 h 27 (~1 h 30), journal
+`~/build-logs/build-amd64-7.3.1.log` sur `homedev`. Image 115 Mo, 4 042 modules
+xz. Publié depuis un staging neuf `~/incoming/staging-amd64-7.3.1-*` : la 7.2.13
+reste en repli, la 7.2.11 est purgée (HTTP 404), les index arm64 et `kernel-dev`
+sont inchangés. Meta amd64 en 7.3.1 avec `Depends` correct, HTTP 200, sha256
+servi identique au construit, `InRelease` des deux suites signé valide. **Ce
+binaire prod n'a pas encore démarré sur du matériel réel** ; seule la variante
+dev a été testée.
+
+```
+KERNEL/      amd64  kernel-auxinuxos 7.3.1-auxinuxos-amd64.1  (+ 7.2.13 de repli)
+             arm64  kernel-auxinuxos 7.2.12-auxinuxos-arm64.1
+KERNEL-DEV/  amd64  kernel-auxinuxos-dev 7.3.1-dev-auxinuxos-amd64.1  (+ 7.3.0-dev de repli)
+```
+
 ### 10.1 Ce que le build à blanc a attrapé
 
 Quatre défauts qu'une vérification de symboles seule ne pouvait pas voir, parce
@@ -506,6 +544,7 @@ La demande porte sur un poste de travail : la validation doit être celle d'un p
 ## 12. Hors périmètre
 
 * **Aucun rétro-portage vers 7.1** : la série est EOL depuis le 2 septembre 2026.
-* **7.3** reste hors sujet tant que la 7.2 n'est pas validée en production.
+* **7.4** reste réservée au canal dev tant qu'elle n'est pas validée ; la prod suit la 7.3.x depuis le 4 novembre 2026 (voir 10.7).
+* **ARM64** : mis de côté pour le moment, la prod arm64 reste en 7.2.12.
 * Les profils `virtua` et `desktop` de ce moteur ne sont **pas** l'objet de ce plan. Ils bénéficient du garde-fou et de la correction de `CGROUP_NS`, rien de plus.
 * OpenZFS reste non publié pour AuxiNuxOS (`no-zfs` imposé par le wrapper). Les gardes DKMS restent en place — elles servent NVIDIA.

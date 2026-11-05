@@ -1,8 +1,18 @@
-# Plan — Kernel AuxiNuxOS `7.2.5-auxinuxos-amd64`
+# Plan — Kernel AuxiNuxOS, série 7.3
 
 **Profil :** `auxinuxos` · **Meta :** `kernel-auxinuxos` · **Suite APT :** `kernel`
-**Dépôt :** `https://dep.auxinux.ca/AUXINUXOS` · **Date :** 12 septembre 2026
-**Statut :** configuration écrite et vérifiée symbole par symbole, aucun build lancé
+**Dépôt :** `https://dep.auxinux.ca/AUXINUXOS`
+
+**État actuel :**
+
+| Canal | Série | Noyau |
+|---|---|---|
+| Prod | **7.3.x** | **7.3.1** (`7.3.1-auxinuxos-amd64`) |
+| Dev | **7.4.x** | aucun build |
+
+La série 7.2 n'est plus suivie. Les sections 0 à 10.6 sont l'historique du plan
+commencé le 12 septembre 2026 sur la 7.2.5 : elles gardent les versions de
+l'époque.
 
 ---
 
@@ -246,14 +256,68 @@ Wi-Fi : correction des trois symboles morts du §0, plus `IWLMLD` (Wi-Fi 7 Intel
 |---|---|---|---|
 | 1 | Garde-fou `cfg()` + `[6a]` + `-config-only` + `CRITICAL_BUILTIN` | `build-kernel-core.sh` | **fait** |
 | 2 | Profil `auxinuxos` réécrit en branche autonome (~450 options) | `build-kernel-core.sh` | **fait** |
-| 3 | Wrapper épinglé sur la série 7.2 + détection EOL | `build-AuxiNuxOS-kernel.sh` | **fait** |
+| 3 | Wrapper épinglé sur la série (7.2 à l'époque, 7.3 aujourd'hui) + détection EOL | `build-AuxiNuxOS-kernel.sh` | **fait** |
 | 4 | Vérification des 516 demandes (499 symboles distincts) contre l'arbre `linux-7.2.5` | index Kconfig | **fait** |
 | 5 | **Build à blanc sur le serveur DEV** | `.config` + rapport `[6a]` | **fait** — 4 défauts trouvés, cf. §10.1 |
 | 6 | Revue du `.config` généré | validation | **fait** — cf. §10.2 |
 | 7 | Build complet | `.deb` dans `OUTPUT_DIR` | **fait** — 2 h 40, cf. §10.3 |
 | 8 | Publication dépôt + purge 7.1.x | suite APT `kernel` | **fait** — cf. §10.4 |
-| 9 | Tests sur matériel réel (§11) | rapport | **à faire — le noyau n'a jamais démarré** |
+| 9 | Tests sur matériel réel (§11) | rapport | **en cours** — 7.3.1-dev testée plusieurs jours sans problème ; campagne §11 non terminée |
 | 10 | Notes de version | — | à faire |
+
+### 10.1 Ce que le build à blanc a attrapé
+
+Quatre défauts qu'une vérification de symboles seule ne pouvait pas voir, parce
+qu'ils dépendent de la résolution des dépendances à partir de la config Debian :
+
+| Constat `[6a]` | Cause | Correctif |
+|---|---|---|
+| `PREEMPT: demandé=y obtenu=n` | `PREEMPT` appartient à un **`choice`**. Écrire `CONFIG_PREEMPT=y` ne suffit pas : `olddefconfig` garde le membre déjà sélectionné par la base Debian (`PREEMPT_LAZY`) et annule la demande **en silence**. | désélectionner `PREEMPT_NONE`/`PREEMPT_VOLUNTARY`/`PREEMPT_LAZY` d'abord |
+| `IP_NF_FILTER/NAT/TARGET_MASQUERADE: demandé=y obtenu=m` | en 7.x ils dépendent de `IP_NF_IPTABLES_LEGACY`, tristate livré en module par Debian : ils **ne peuvent pas** être built-in | passer en `--module` (sans conséquence : `docker` et `lxc-net` les chargent à la demande) |
+| `FW_LOADER_USER_HELPER: demandé=n obtenu=y` | sélectionné par plusieurs pilotes, impossible à forcer à `n` | viser `FW_LOADER_USER_HELPER_FALLBACK` — c'est lui qui fait attendre 60 s à chaque firmware absent |
+| Build interrompu sur `CONFIG_DEBUG_INFO=y` | le garde de `[6/9]` datait d'avant l'activation du BTF, qui **impose** du DWARF complet | le garde tient compte du profil |
+
+Le premier est le plus instructif : sans le build à blanc, tout le travail sur
+la latence (§3.4) tombait à l'eau **sans un seul message**, et le noyau aurait
+été publié en `PREEMPT_LAZY` alors que la note de version aurait annoncé une
+préemption complète.
+
+Reste **un** avertissement, bénin et documenté : `SYSTEM_REVOCATION_KEYS`
+n'est pas émis tant que `SYSTEM_REVOCATION_LIST` est à `n` — c'est le résultat
+voulu (aucune clé de révocation).
+
+### 10.2 `.config` retenu — contrôles
+
+```
+CONFIG_PREEMPT=y            CONFIG_HZ=1000           CONFIG_SCHED_AUTOGROUP=y
+CONFIG_BTRFS_FS=y           CONFIG_TMPFS_XATTR=y     CONFIG_ZSTD_COMPRESS=y
+CONFIG_PSI=y                (PSI_DEFAULT_DISABLED absent)
+CONFIG_MEMCG=y              CONFIG_ZRAM=m            CONFIG_ZRAM_DEF_COMP_ZSTD=y
+CONFIG_LRU_GEN_ENABLED=y    CONFIG_NTSYNC=m          CONFIG_IA32_EMULATION=y
+CONFIG_DRM=y                CONFIG_DRM_SIMPLEDRM=y   CONFIG_SYSFB_SIMPLEFB=y
+CONFIG_DRM_AMD_DC=y         CONFIG_DRM_AMDGPU=m      CONFIG_DRM_I915=m
+CONFIG_VFAT_FS=y            CONFIG_SATA_AHCI=y       CONFIG_BLK_DEV_NVME=y
+CONFIG_EFIVAR_FS=y          CONFIG_MODVERSIONS=y     (TRIM_UNUSED_KSYMS absent)
+CONFIG_LSM="landlock,lockdown,yama,integrity,apparmor,bpf"
+```
+
+`477 options demandées`, 21 721 symboles Kconfig indexés, toutes les options
+`CRITICAL` présentes et toutes les `CRITICAL_BUILTIN` réellement en `=y`.
+
+```bash
+# 5. build à blanc — À FAIRE EN PREMIER sur le serveur de build
+./build-AuxiNuxOS-kernel.sh -config-only
+
+# 7. build complet
+./build-AuxiNuxOS-kernel.sh
+
+# 9. publication
+sudo GPG_KEY=repo@auxinux.ca ./build-depot-AuxiNuxOS.sh ./output
+```
+
+### Pourquoi l'étape 5 reste indispensable
+
+Les 516 demandes ont été confrontées à l'arbre 7.2.5 réel : **aucun symbole n'est inexistant**, et la cohérence type/action a été contrôlée (pas de `--module` sur un `bool`, pas de `--disable` sur un entier). Ce qui **n'a pas** pu être vérifié ici, faute de chaîne de compilation complète (`flex`, `bison`, `bc`), c'est la résolution des **dépendances** par `olddefconfig` à partir de la config Debian de base. C'est exactement ce que rapporte l'étape `[6a]` sous le verdict *IGNORÉ*, et c'est ce que le build à blanc doit produire avant la première compilation longue.
 
 ### 10.3 Build et taille du paquet
 
@@ -392,29 +456,13 @@ KERNEL/  amd64  kernel-auxinuxos 7.2.11-auxinuxos-amd64.1  (+ 7.2.5 de repli)
 
 **AMD64, 7.2.13 (27 octobre 2026).** Build à blanc d'abord : config identique
 à celle de la 7.2.11 publiée (seuls les commentaires diffèrent). Compilé sur
-`virtua-dev` de 14 h 24 à 19 h 09 (~4 h 45), journal dans
+`virtua-dev` de 14 h 24 à 19 h 09 (~4 h 45, quota de 2 CPU), journal dans
 `~/build-logs/build-amd64-7.2.13.log`. Image 165 Mo, 4 045 modules xz. Publié
 depuis un staging neuf `~/incoming/staging-amd64-7.2.13-20261027231600` avec
 la rétention par défaut (`KEEP_VERSIONS=2`) : la 7.2.11 reste en repli, la
 7.2.5 est purgée (HTTP 404), l'arm64 7.2.12 est intact. Meta amd64 en 7.2.13
 avec `Depends` correct, sha256 servi identique au construit, `InRelease` des
 deux suites signé valide. **Pas encore démarré sur du matériel réel.**
-
-```
-KERNEL/  amd64  kernel-auxinuxos 7.2.13-auxinuxos-amd64.1  (+ 7.2.11 de repli)
-         arm64  kernel-auxinuxos 7.2.12-auxinuxos-arm64.1
-```
-
-**AMD64, 7.2.13 (27 octobre 2026).** Config issue du build à blanc identique
-à celle de la 7.2.11 publiée (hors commentaires) — le moteur modifié pour
-l'arm64 ne change donc rien à l'amd64. Compilé sur `virtua-dev` de 14 h 24 à
-19 h 09 (~4 h 45, quota de 2 CPU), journal `~/build-logs/build-amd64-7.2.13.log`.
-Image : 4 045 modules xz. Publié en prod depuis un staging neuf
-`~/incoming/staging-amd64-7.2.13-*`, rétention par défaut (`KEEP_VERSIONS=2`) :
-la 7.2.11 reste en repli, la 7.2.5 est purgée (HTTP 404), l'arm64 7.2.12 est
-intact. Meta `kernel-auxinuxos` amd64 en 7.2.13 avec `Depends` correct, HTTP
-200, sha256 servi identique au construit, `InRelease` des deux suites signé
-valide. **Pas encore démarré sur du matériel réel.**
 
 ```
 KERNEL/  amd64  kernel-auxinuxos 7.2.13-auxinuxos-amd64.1  (+ 7.2.11 de repli)
@@ -450,8 +498,8 @@ l'utilisateur sur sa machine, sans problème signalé.
 **Décision (4 novembre).** La 7.3.x devient la série de production et la 7.4.x
 celle du canal dev, défauts inscrits dans le wrapper (`cf64e41`). kernel.org
 marque la 7.2 EOL depuis la 7.2.15. Tant que la 7.4 n'a pas de version stable,
-`track=dev` exige `--channel=mainline`. L'arm64 est mis de côté pour le moment
-et reste en 7.2.12, sur une série EOL.
+`track=dev` exige `--channel=mainline`. **Aucun build 7.4 n'est prévu pour
+l'instant.** L'arm64 est mis de côté pour le moment.
 
 **Prod, 7.3.1 (4 novembre).** Config identique à la 7.3.1-dev testée, hors
 `LOCALVERSION`. Compilé de 17 h 59 à 19 h 27 (~1 h 30), journal
@@ -468,60 +516,6 @@ KERNEL/      amd64  kernel-auxinuxos 7.3.1-auxinuxos-amd64.1  (+ 7.2.13 de repli
              arm64  kernel-auxinuxos 7.2.12-auxinuxos-arm64.1
 KERNEL-DEV/  amd64  kernel-auxinuxos-dev 7.3.1-dev-auxinuxos-amd64.1  (+ 7.3.0-dev de repli)
 ```
-
-### 10.1 Ce que le build à blanc a attrapé
-
-Quatre défauts qu'une vérification de symboles seule ne pouvait pas voir, parce
-qu'ils dépendent de la résolution des dépendances à partir de la config Debian :
-
-| Constat `[6a]` | Cause | Correctif |
-|---|---|---|
-| `PREEMPT: demandé=y obtenu=n` | `PREEMPT` appartient à un **`choice`**. Écrire `CONFIG_PREEMPT=y` ne suffit pas : `olddefconfig` garde le membre déjà sélectionné par la base Debian (`PREEMPT_LAZY`) et annule la demande **en silence**. | désélectionner `PREEMPT_NONE`/`PREEMPT_VOLUNTARY`/`PREEMPT_LAZY` d'abord |
-| `IP_NF_FILTER/NAT/TARGET_MASQUERADE: demandé=y obtenu=m` | en 7.x ils dépendent de `IP_NF_IPTABLES_LEGACY`, tristate livré en module par Debian : ils **ne peuvent pas** être built-in | passer en `--module` (sans conséquence : `docker` et `lxc-net` les chargent à la demande) |
-| `FW_LOADER_USER_HELPER: demandé=n obtenu=y` | sélectionné par plusieurs pilotes, impossible à forcer à `n` | viser `FW_LOADER_USER_HELPER_FALLBACK` — c'est lui qui fait attendre 60 s à chaque firmware absent |
-| Build interrompu sur `CONFIG_DEBUG_INFO=y` | le garde de `[6/9]` datait d'avant l'activation du BTF, qui **impose** du DWARF complet | le garde tient compte du profil |
-
-Le premier est le plus instructif : sans le build à blanc, tout le travail sur
-la latence (§3.4) tombait à l'eau **sans un seul message**, et le noyau aurait
-été publié en `PREEMPT_LAZY` alors que la note de version aurait annoncé une
-préemption complète.
-
-Reste **un** avertissement, bénin et documenté : `SYSTEM_REVOCATION_KEYS`
-n'est pas émis tant que `SYSTEM_REVOCATION_LIST` est à `n` — c'est le résultat
-voulu (aucune clé de révocation).
-
-### 10.2 `.config` retenu — contrôles
-
-```
-CONFIG_PREEMPT=y            CONFIG_HZ=1000           CONFIG_SCHED_AUTOGROUP=y
-CONFIG_BTRFS_FS=y           CONFIG_TMPFS_XATTR=y     CONFIG_ZSTD_COMPRESS=y
-CONFIG_PSI=y                (PSI_DEFAULT_DISABLED absent)
-CONFIG_MEMCG=y              CONFIG_ZRAM=m            CONFIG_ZRAM_DEF_COMP_ZSTD=y
-CONFIG_LRU_GEN_ENABLED=y    CONFIG_NTSYNC=m          CONFIG_IA32_EMULATION=y
-CONFIG_DRM=y                CONFIG_DRM_SIMPLEDRM=y   CONFIG_SYSFB_SIMPLEFB=y
-CONFIG_DRM_AMD_DC=y         CONFIG_DRM_AMDGPU=m      CONFIG_DRM_I915=m
-CONFIG_VFAT_FS=y            CONFIG_SATA_AHCI=y       CONFIG_BLK_DEV_NVME=y
-CONFIG_EFIVAR_FS=y          CONFIG_MODVERSIONS=y     (TRIM_UNUSED_KSYMS absent)
-CONFIG_LSM="landlock,lockdown,yama,integrity,apparmor,bpf"
-```
-
-`477 options demandées`, 21 721 symboles Kconfig indexés, toutes les options
-`CRITICAL` présentes et toutes les `CRITICAL_BUILTIN` réellement en `=y`.
-
-```bash
-# 5. build à blanc — À FAIRE EN PREMIER sur le serveur de build
-./build-AuxiNuxOS-kernel.sh -config-only
-
-# 7. build complet
-./build-AuxiNuxOS-kernel.sh
-
-# 9. publication
-sudo GPG_KEY=repo@auxinux.ca ./build-depot-AuxiNuxOS.sh ./output
-```
-
-### Pourquoi l'étape 5 reste indispensable
-
-Les 516 demandes ont été confrontées à l'arbre 7.2.5 réel : **aucun symbole n'est inexistant**, et la cohérence type/action a été contrôlée (pas de `--module` sur un `bool`, pas de `--disable` sur un entier). Ce qui **n'a pas** pu être vérifié ici, faute de chaîne de compilation complète (`flex`, `bison`, `bc`), c'est la résolution des **dépendances** par `olddefconfig` à partir de la config Debian de base. C'est exactement ce que rapporte l'étape `[6a]` sous le verdict *IGNORÉ*, et c'est ce que le build à blanc doit produire avant la première compilation longue.
 
 ---
 
@@ -544,7 +538,7 @@ La demande porte sur un poste de travail : la validation doit être celle d'un p
 ## 12. Hors périmètre
 
 * **Aucun rétro-portage vers 7.1** : la série est EOL depuis le 2 septembre 2026.
-* **7.4** reste réservée au canal dev tant qu'elle n'est pas validée ; la prod suit la 7.3.x depuis le 4 novembre 2026 (voir 10.7).
-* **ARM64** : mis de côté pour le moment, la prod arm64 reste en 7.2.12.
+* **7.4** : série du canal dev, **aucun build pour l'instant**. La prod suit la 7.3.x depuis le 4 novembre 2026 (voir 10.7).
+* **ARM64** : mis de côté pour le moment.
 * Les profils `virtua` et `desktop` de ce moteur ne sont **pas** l'objet de ce plan. Ils bénéficient du garde-fou et de la correction de `CGROUP_NS`, rien de plus.
 * OpenZFS reste non publié pour AuxiNuxOS (`no-zfs` imposé par le wrapper). Les gardes DKMS restent en place — elles servent NVIDIA.

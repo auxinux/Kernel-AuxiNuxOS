@@ -11,8 +11,8 @@ CHANNEL="current"
 # changement de série change les pilotes et les options de configuration; il
 # se décide, il ne s'attrape pas au détour d'un build automatique.
 #
-# La série 7.2 est marquée EOL sur kernel.org depuis 7.2.15: elle ne recevra
-# plus de correctif de sécurité. La 7.3 a été validée en canal dev (7.3.1).
+# La 7.3 a été validée en canal dev (7.3.1); la série 7.2, EOL, n'est plus suivie.
+# Canal dev: la série 7.4 est réservée, aucun build pour l'instant.
 PROD_BRANCH="7.3"
 DEV_BRANCH="7.4"
 BRANCH="${AUXINUXOS_KERNEL_BRANCH:-}"
@@ -41,7 +41,7 @@ Usage:
 
 Kernel series:
   AuxiNuxOS production tracks the 7.3 series by default (--branch=7.3) and
-  track=dev tracks the 7.4 series. The 7.2 series is EOL on kernel.org.
+  track=dev tracks the 7.4 series.
   Pinning the SERIES, not the revision, means 7.3.1 -> 7.3.2 -> ... happen on
   their own while a jump to 7.4 stays an explicit decision.
 
@@ -85,7 +85,7 @@ Examples:
   $0 --branch=7.4 -arch=amd64               # move the production series
   $0 --channel=lts --branch=6.18 -arch=amd64
   $0 --channel=mainline -arch=amd64
-  $0 KERNEL_VERSION=7.2.5 -arch=arm64
+  $0 KERNEL_VERSION=7.3.1 -arch=arm64
 
 Output kernel release:
   X.Y.Z-auxinuxos-amd64

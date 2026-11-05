@@ -16,7 +16,9 @@ sudo GPG_KEY=repo@auxinux.ca ./build-depot-AuxiNuxOS.sh ./output
 
 | | |
 |---|---|
-| Série noyau | **7.3.x** en prod (`--branch=7.3` par défaut), **7.4.x** en dev |
+| Série noyau | **7.3.x** en prod (`--branch=7.3` par défaut) |
+| Noyau disponible | **7.3.1** (`7.3.1-auxinuxos-amd64`) |
+| Canal dev | série **7.4.x**, aucun build pour l'instant |
 | Architectures | **amd64** et **arm64** |
 | Release produite | `X.Y.Z-auxinuxos-amd64`, `X.Y.Z-auxinuxos-arm64` |
 | Paquet meta | `kernel-auxinuxos` |
@@ -27,7 +29,7 @@ sudo GPG_KEY=repo@auxinux.ca ./build-depot-AuxiNuxOS.sh ./output
 Ce noyau vise une seule machine qui doit faire de la **bureautique**, du
 **multimédia** et du **jeu**, sans perdre **LXC**, **Docker** ni **KVM**. Les
 choix de configuration et leur justification sont dans
-[PLAN-7.2-DESKTOP.md](PLAN-7.2-DESKTOP.md). En résumé :
+[PLAN-7.3-DESKTOP.md](PLAN-7.3-DESKTOP.md). En résumé :
 
 * **GPU Intel, AMD et NVIDIA** — `i915` + `xe`, `amdgpu` avec Display Core et
   le support GCN 1/2, `nouveau`. Le pilote NVIDIA propriétaire compile via DKMS
@@ -135,9 +137,8 @@ pilotes et les options ; il se décide.
 ./build-AuxiNuxOS-kernel.sh --branch=any       # suivre la dernière stable
 ```
 
-> La série **7.2 est marquée EOL** sur kernel.org depuis 7.2.15 et ne recevra
-> plus de correctif de sécurité. Le wrapper avertit si la version résolue est
-> marquée EOL.
+> AuxiNuxOS ne suit plus la série 7.2, marquée EOL sur kernel.org. Le wrapper
+> avertit si la version résolue est marquée EOL.
 
 Deux canaux de publication coexistent, physiquement séparés côté dépôt :
 

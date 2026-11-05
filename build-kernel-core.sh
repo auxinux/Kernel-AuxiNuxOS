@@ -264,7 +264,7 @@ Examples:
   $0 KERNEL_VERSION=6.12.31
   $0 profile=desktop -arch=arm64 KERNEL_VERSION=6.12.31 JOBS=8
   $0 source=debian KERNEL_MAJOR=6.12
-  $0 profile=auxinuxos KERNEL_VERSION=7.2.5 -config-only   # build à blanc
+  $0 profile=auxinuxos KERNEL_VERSION=7.3.1 -config-only   # build à blanc
   $0 ZFS_SHA256=<hash>                 # build + modules ZFS 2.4.2 vérifiés
   $0 no-zfs                            # kernel seul, sans modules ZFS
   $0 profile=all -docker               # build dans un conteneur debian:13 amd64
